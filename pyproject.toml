@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "CA-MLT-YOLO"
+version = "0.1"
+description = "Cross-Attention Multi-Task Learning for YOLOv8-based Object Detection and Segmentation"
+readme = "README.md"
+requires-python = ">=3.10"
+
+authors = [
+  {name = "Mario Pascual-González", email = "mpascual@uma.es"},
+  {name = "Ezequiel López-Rubio", email = "eqzlr@uma.es"},
+]
+
+# ────────────── Runtime deps ──────────────
+dependencies = [
+    # ...
+]
+
+[project.urls]
+Homepage = "https://github.com/MarioPasc/CA-MLT-YOLOv8"
+
+# NOTE: We vendor a modified copy of the ultralytics package (top-level 'ultralytics/' directory).
+# To ensure it is installed together with CA-MLT-YOLO (and preferred on sys.path over any PyPI ultralytics),
+# we include it explicitly below instead of declaring a dependency on upstream 'ultralytics'.
+# Recommend installing in a fresh virtualenv to avoid conflicts with an already installed ultralytics wheel.
+
+# ────────────── Setuptools discovery ──────
+
+[tool.setuptools.packages.find]
+# Discover our main package and the vendored top-level 'ultralytics' package
+include = [
+  "camlt_yolo",
+  "camlt_yolo.*",
+  "ultralytics",
+  "ultralytics.*",
+  "cli",
+  "cli.*",
+]
+
+[tool.setuptools.package-dir]
+ultralytics = "camlt_yolo/external/ultralytics/ultralytics"
+
+[tool.setuptools.package-data]
+"camlt_yolo.external.ultralytics" = ["*"]
+"ultralytics" = ["*"]
