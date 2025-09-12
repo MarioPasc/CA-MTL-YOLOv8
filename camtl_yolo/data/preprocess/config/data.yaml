@@ -17,7 +17,6 @@ detect_datasets:
   - ARCADE
 segment_datasets:
   - FS-CAD
-  - ARCADE
   - DCA1
   - XCAV
 # We have hard-coded the insides of the datasets. 

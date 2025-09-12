@@ -32,6 +32,7 @@ def main():
     output_dir = config["output_dir"]
     segment_datasets = config.get("segment_datasets", [])
 
+    # --- Segmentation datasets ---
     seg_img_dir = Path(output_dir) / "segmentation" / "images"
     seg_lbl_dir = Path(output_dir) / "segmentation" / "labels"
     seg_img_dir.mkdir(parents=True, exist_ok=True)
@@ -73,6 +74,51 @@ def main():
             logger.debug(f"Saved {out_name}")
         except Exception as e:
             logger.error(f"Error processing {img_path} or {mask_path}: {e}")
+
+    # --- Detection datasets ---
+    from camtl_yolo.data.preprocess.modules import arcade_stenosis, cadica
+    detect_img_dir = Path(output_dir) / "detection" / "images"
+    detect_lbl_dir = Path(output_dir) / "detection" / "labels"
+    detect_img_dir.mkdir(parents=True, exist_ok=True)
+    detect_lbl_dir.mkdir(parents=True, exist_ok=True)
+
+    # ARCADE detection dataset
+    arcade_dir = os.path.join(root, "detect", "ARCADE")
+    logger.info(f"Collecting ARCADE detection: {arcade_dir}")
+    arcade_pairs = arcade_stenosis.collect_image_label_pairs(arcade_dir)
+    for img_path, label_path, split, number in arcade_pairs:
+        out_name_img = f"ARCADE{split}_{number}.png"
+        out_name_lbl = f"ARCADE{split}_{number}.txt"
+        img_out_path = detect_img_dir / out_name_img
+        lbl_out_path = detect_lbl_dir / out_name_lbl
+        try:
+            from PIL import Image
+            with Image.open(img_path) as img:
+                img.save(img_out_path)
+            with open(label_path, 'r') as fin, open(lbl_out_path, 'w') as fout:
+                fout.write(fin.read())
+            logger.debug(f"Saved {out_name_img} and {out_name_lbl}")
+        except Exception as e:
+            logger.error(f"Error processing {img_path} or {label_path}: {e}")
+
+    # CADICA detection dataset
+    cadica_dir = os.path.join(root, "detect", "CADICA")
+    logger.info(f"Collecting CADICA detection: {cadica_dir}")
+    cadica_pairs = cadica.collect_image_label_pairs(cadica_dir, logger=logger)
+    for img_path, label_path, unique_name in cadica_pairs:
+        out_name_img = f"{unique_name}.png"
+        out_name_lbl = f"{unique_name}.txt"
+        img_out_path = detect_img_dir / out_name_img
+        lbl_out_path = detect_lbl_dir / out_name_lbl
+        try:
+            from PIL import Image
+            with Image.open(img_path) as img:
+                img.save(img_out_path)
+            with open(label_path, 'r') as fin, open(lbl_out_path, 'w') as fout:
+                fout.write(fin.read())
+            logger.debug(f"Saved {out_name_img} and {out_name_lbl}")
+        except Exception as e:
+            logger.error(f"Error processing {img_path} or {label_path}: {e}")
 
 if __name__ == "__main__":
     main()

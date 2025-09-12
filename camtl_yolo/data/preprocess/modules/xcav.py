@@ -34,10 +34,10 @@ def collect_image_mask_pairs(input_dir: str, logger = None) -> List[Tuple[str, s
                 if img_file.exists():
                     pairs.append((str(img_file), str(mask_file)))
                     if logger:
-                        logger.info(f"Pair found: {img_file} <-> {mask_file}")
+                        logger.debug(f"Pair found: {img_file} <-> {mask_file}")
                 else:
                     if logger:
                         logger.warning(f"Image not found for mask: {mask_file}")
     if logger:
-        logger.info(f"Total pairs found in XCAV: {len(pairs)}")
+        logger.debug(f"Total pairs found in XCAV: {len(pairs)}")
     return pairs
