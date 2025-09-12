@@ -28,3 +28,12 @@ preprocessing:
   img_size: [640, 640]
   # Whether to convert images to grayscale
   dtype: uint8
+  # CLAHE enchancement for contrast improvement
+  clahe:
+    enabled: true
+    apply_to: "segmentation" # "detection", "segmentation", "both"
+    window_size: 5
+    sigma: 1.0
+    clipLimit: 2.0
+    tileGridSize: "(8, 8)"
+    border_type: "cv2.BORDER_CONSTANT"

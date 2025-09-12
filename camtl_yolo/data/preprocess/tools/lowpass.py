@@ -27,15 +27,3 @@ def apply_lowpass(image: np.ndarray, window_size:int = 5, sigma: float = 1.0, bo
     kernel /= np.sum(kernel)
     smoothed = cv2.filter2D(image, -1, kernel, borderType=border_type)
     return smoothed
-
-if __name__ == "__main__":
-    # Example usage:
-    input_path = "path/to/input.png"
-    output_path = "path/to/smoothed.png"
-    img = cv2.imread(input_path, cv2.IMREAD_GRAYSCALE)
-    if img is not None:
-        smoothed_img = apply_lowpass(img, window_size=5, sigma=1.0)
-        cv2.imwrite(output_path, smoothed_img)
-        print("Lowpass filtering applied successfully.")
-    else:
-        print("Error reading the image.")
