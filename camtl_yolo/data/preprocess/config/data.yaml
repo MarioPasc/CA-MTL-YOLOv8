@@ -22,3 +22,9 @@ segment_datasets:
 # We have hard-coded the insides of the datasets. 
 # If you want to add your own dataset, you will need to modify the code.
 output_dir: /media/mpascual/PortableSSD/Coronariografías/processed_data
+
+preprocessing:
+  # Resize images to this size (width, height)
+  img_size: [640, 640]
+  # Whether to convert images to grayscale
+  dtype: uint8

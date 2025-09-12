@@ -1,0 +1,48 @@
+# ica_yolo_detection/preprocessing/tools/fse.py
+
+import cv2
+import numpy as np
+from camtl_yolo.data.preprocess.tools.lowpass import apply_lowpass
+
+def filtering_smoothing_equalization(image: np.ndarray, window_size: int = 5, sigma: float=1.0) -> np.ndarray:
+    """
+    Apply Filtering Smoothing Equalization to a grayscale image.
+    
+    This function performs two sequential steps on a grayscale image:
+    
+    1. **Gaussian Smoothing:**  
+       A Gaussian kernel of size (window_size x window_size) is computed using:
+         w(i,j) = (1 / (2*pi*sigma^2)) * exp( -((i - c)^2 + (j - c)^2) / (2*sigma^2) )
+       where c = window_size // 2. The kernel is normalized so that its sum is 1,
+       and the image is convolved with this kernel using OpenCV's filter2D.
+    
+    2. **Histogram Equalization:**  
+       The histogram of the smoothed image is computed over 256 gray levels.
+       The cumulative distribution function (CDF) is used to map each pixel value a to:
+         H(a) = round( (CDF(a) - CDF(min)) / (M*N - 1) * (L - 1) )
+       where M*N is the total number of pixels and L=256.
+       
+    Args:
+        image (np.ndarray): Input grayscale image as a NumPy array.
+        window_size (int): Size of the Gaussian filter window (e.g., 5 for a 5x5 window).
+        sigma (float): Standard deviation for the Gaussian kernel.
+    
+    Returns:
+        np.ndarray: The enhanced image after Gaussian smoothing and histogram equalization.
+    """
+    # --- Step 1: Gaussian Smoothing ---
+    smoothed = apply_lowpass(image=image, window_size=window_size, sigma=sigma)
+    
+    # --- Step 2: Histogram Equalization ---
+    # Assume image pixel range is 0-255.
+    hist, _ = np.histogram(smoothed.flatten(), bins=256, range=(0,256))
+    cdf = hist.cumsum()
+    cdf_masked = np.ma.masked_equal(cdf, 0)
+    # Normalize the CDF: (cdf - cdf_min) / (total_pixels - cdf_min) * 255.
+    cdf_min = cdf_masked.min()
+    total_pixels = smoothed.size
+    cdf_normalized = (cdf_masked - cdf_min) * 255 / (total_pixels - cdf_min)
+    cdf_final = np.ma.filled(cdf_normalized, 0).astype('uint8')
+    
+    equalized = cdf_final[smoothed]
+    return equalized
