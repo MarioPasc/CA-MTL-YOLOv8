@@ -1,14 +1,15 @@
 
 # Root to both detection and segment datasets. We expect the following structure:
 #  root
-#   ├── detect
-#   │   ├── dataset1
-#   │   ├── ...
-#   │   └── datasetN
-#   ├── segment
-#   │   ├── dataset1
-#   │   ├── ...
-#   │   └── datasetN
+#   ├── angiography
+#   │   ├── detect
+#   │   │   ├── dataset1
+#   │   │   ├── ...
+#   │   │   └── datasetN
+#   │   └── segment
+#   │       ├── dataset1
+#   │       ├── ...
+#   │       └── datasetN
 #   └── retinography
 #       ├── dataset1
 #       ├── ...
@@ -32,14 +33,20 @@ retinography_datasets:
 output_dir: /media/mpascual/PortableSSD/Coronariografías/processed_data
 
 preprocessing:
+  # Image format
+  img_format: png
   # Resize images to this size (width, height)
   img_size: [640, 640]
   # Whether to convert images to grayscale
+  to_gray: true
+  # Data type
   dtype: uint8
+  # Detect Labels to
+  detect_labels_to_yolo: true
   # CLAHE enchancement for contrast improvement
   clahe:
-    enabled: true
-    apply_to: "segmentation" # "detection", "segmentation", "retinography", "all"
+    enabled: false
+    apply_to: ["angiography/segment", "retinography"] # options: "angiography/detect", "angiography/segment", "retinography"
     window_size: 5
     sigma: 1.0
     clipLimit: 2.0
