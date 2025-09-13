@@ -1,12 +1,36 @@
-"""
-Main generator script for dataset processing.
-Reads data.yaml and dynamically calls dataset-specific processing modules.
+"""Unified data standardization generator.
+
+Target standardized structure (under output_dir):
+
+output_dir/
+    angiographies/
+        segment/
+            images/
+            labels/
+        detect/
+            images/
+            labels/
+    retinography/
+        images/
+        labels/
+
+Config (data.yaml) expected keys:
+    root: base path containing subfolders detect/, segment/, retinography/
+    detect_datasets: list[str]
+    segment_datasets: list[str]
+    retinography_datasets: list[str]
+    output_dir: destination root
+
+Each dataset module must expose the appropriate collector function:
+    segmentation: collect_image_mask_pairs(input_dir) -> List[(img, mask)]
+    detection: collect_image_label_pairs(input_dir) -> List[(img, label, ...)]
+    retinography: collect_image_mask_pairs(input_dir) (same signature as segmentation)
 """
 import os
 import sys
 import yaml
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, List, Tuple
 from tqdm import tqdm
 
 def main():
@@ -17,7 +41,7 @@ def main():
         sys.path.insert(0, PROJECT_ROOT)
 
     from camtl_yolo.utils.logger import get_logger
-    from camtl_yolo.data.preprocess.modules import dca1, fs_cad, xcav
+    from camtl_yolo.data.preprocess.modules import dca1, fs_cad, xcav, chasedb1, drive, fives
 
     logger = get_logger("generator")
 
@@ -28,97 +52,168 @@ def main():
     config_path = Path(__file__).parent / "config" / "data.yaml"
     config = load_config(str(config_path))
 
-    root = config["root"]
-    output_dir = config["output_dir"]
-    segment_datasets = config.get("segment_datasets", [])
+    root = config.get("root")
+    output_dir = config.get("output_dir")
+    segment_datasets: List[str] = config.get("segment_datasets", [])
+    detect_datasets: List[str] = config.get("detect_datasets", [])
+    retino_datasets: List[str] = config.get("retinography_datasets", [])
 
-    # --- Segmentation datasets ---
-    seg_img_dir = Path(output_dir) / "segmentation" / "images"
-    seg_lbl_dir = Path(output_dir) / "segmentation" / "labels"
-    seg_img_dir.mkdir(parents=True, exist_ok=True)
-    seg_lbl_dir.mkdir(parents=True, exist_ok=True)
+    if not root or not output_dir:
+        logger.error("Config must include 'root' and 'output_dir'. Exiting.")
+        return
 
-    all_pairs = []
+    # Prepare target directory tree
+    angiography_segment_img = Path(output_dir) / "angiographies" / "segment" / "images"
+    angiography_segment_lbl = Path(output_dir) / "angiographies" / "segment" / "labels"
+    angiography_detect_img = Path(output_dir) / "angiographies" / "detect" / "images"
+    angiography_detect_lbl = Path(output_dir) / "angiographies" / "detect" / "labels"
+    retino_img_dir = Path(output_dir) / "retinography" / "images"
+    retino_lbl_dir = Path(output_dir) / "retinography" / "labels"
+    for p in [angiography_segment_img, angiography_segment_lbl,
+              angiography_detect_img, angiography_detect_lbl,
+              retino_img_dir, retino_lbl_dir]:
+        p.mkdir(parents=True, exist_ok=True)
+
+    # ================= Segment (Angiographies) =================
+    all_seg_pairs: List[Tuple[str, str, str]] = []  # (img, mask, dataset_name)
     for dataset in segment_datasets:
+        ds_input = os.path.join(root, "segment", dataset)
         if dataset == "DCA1":
-            input_dir = os.path.join(root, "segment", "DCA1")
-            logger.info(f"Collecting DCA1: {input_dir}")
-            pairs = dca1.collect_image_mask_pairs(input_dir)
-            for img, mask in pairs:
-                all_pairs.append((img, mask, "DCA1"))
+            logger.info(f"Collecting DCA1: {ds_input}")
+            pairs = dca1.collect_image_mask_pairs(ds_input)
         elif dataset == "FS-CAD":
-            input_dir = os.path.join(root, "segment", "FS-CAD")
-            logger.info(f"Collecting FS-CAD: {input_dir}")
-            pairs = fs_cad.collect_image_mask_pairs(input_dir)
-            for img, mask in pairs:
-                all_pairs.append((img, mask, "FS-CAD"))
+            logger.info(f"Collecting FS-CAD: {ds_input}")
+            pairs = fs_cad.collect_image_mask_pairs(ds_input)
         elif dataset == "XCAV":
-            input_dir = os.path.join(root, "segment", "XCAV")
-            logger.info(f"Collecting XCAV: {input_dir}")
-            pairs = xcav.collect_image_mask_pairs(input_dir, logger=logger)
-            for img, mask in pairs:
-                all_pairs.append((img, mask, "XCAV"))
+            logger.info(f"Collecting XCAV: {ds_input}")
+            pairs = xcav.collect_image_mask_pairs(ds_input, logger=logger)
         else:
-            logger.warning(f"No processing script for dataset: {dataset}")
+            logger.warning(f"Unknown segmentation dataset: {dataset}")
+            continue
+        for img, mask in pairs:
+            all_seg_pairs.append((img, mask, dataset))
 
-    for idx, (img_path, mask_path, dataset_name) in enumerate(all_pairs, 1):
+    for idx, (img_path, mask_path, dataset_name) in enumerate(all_seg_pairs, 1):
         out_name = f"{dataset_name}_{idx:06d}.png"
-        img_out_path = seg_img_dir / out_name
-        mask_out_path = seg_lbl_dir / out_name
+        img_out_path = angiography_segment_img / out_name
+        mask_out_path = angiography_segment_lbl / out_name
         try:
             from PIL import Image
             with Image.open(img_path) as img:
                 img.save(img_out_path)
             with Image.open(mask_path) as mask:
                 mask.save(mask_out_path)
-            logger.debug(f"Saved {out_name}")
         except Exception as e:
-            logger.error(f"Error processing {img_path} or {mask_path}: {e}")
+            logger.error(f"[SEG] Error processing {img_path} or {mask_path}: {e}")
 
-    # --- Detection datasets ---
+    logger.info(f"Segmentation (angiographies): {len(all_seg_pairs)} pairs saved.")
+
+    # ================= Detection (Angiographies) =================
     from camtl_yolo.data.preprocess.modules import arcade_stenosis, cadica
-    detect_img_dir = Path(output_dir) / "detection" / "images"
-    detect_lbl_dir = Path(output_dir) / "detection" / "labels"
-    detect_img_dir.mkdir(parents=True, exist_ok=True)
-    detect_lbl_dir.mkdir(parents=True, exist_ok=True)
-
-    # ARCADE detection dataset
-    arcade_dir = os.path.join(root, "detect", "ARCADE")
-    logger.info(f"Collecting ARCADE detection: {arcade_dir}")
-    arcade_pairs = arcade_stenosis.collect_image_label_pairs(arcade_dir)
-    for img_path, label_path, split, number in arcade_pairs:
-        out_name_img = f"ARCADE{split}_{number}.png"
-        out_name_lbl = f"ARCADE{split}_{number}.txt"
-        img_out_path = detect_img_dir / out_name_img
-        lbl_out_path = detect_lbl_dir / out_name_lbl
+    # ARCADE
+    if "ARCADE" in detect_datasets:
+        arcade_dir = os.path.join(root, "detect", "ARCADE")
+        logger.info(f"Collecting ARCADE detection: {arcade_dir}")
         try:
-            from PIL import Image
-            with Image.open(img_path) as img:
-                img.save(img_out_path)
-            with open(label_path, 'r') as fin, open(lbl_out_path, 'w') as fout:
-                fout.write(fin.read())
-            logger.debug(f"Saved {out_name_img} and {out_name_lbl}")
+            arcade_pairs = arcade_stenosis.collect_image_label_pairs(arcade_dir)
+            for img_path, label_path, split, number in arcade_pairs:
+                out_img = f"ARCADE{split}_{number}.png"
+                out_lbl = f"ARCADE{split}_{number}.txt"
+                img_out_path = angiography_detect_img / out_img
+                lbl_out_path = angiography_detect_lbl / out_lbl
+                try:
+                    from PIL import Image
+                    with Image.open(img_path) as img:
+                        img.save(img_out_path)
+                    with open(label_path) as fin, open(lbl_out_path, 'w') as fout:
+                        fout.write(fin.read())
+                except Exception as e:
+                    logger.error(f"[DETECT][ARCADE] Error processing {img_path}: {e}")
         except Exception as e:
-            logger.error(f"Error processing {img_path} or {label_path}: {e}")
-
-    # CADICA detection dataset
-    cadica_dir = os.path.join(root, "detect", "CADICA")
-    logger.info(f"Collecting CADICA detection: {cadica_dir}")
-    cadica_pairs = cadica.collect_image_label_pairs(cadica_dir, logger=logger)
-    for img_path, label_path, unique_name in cadica_pairs:
-        out_name_img = f"{unique_name}.png"
-        out_name_lbl = f"{unique_name}.txt"
-        img_out_path = detect_img_dir / out_name_img
-        lbl_out_path = detect_lbl_dir / out_name_lbl
+            logger.error(f"Failed collecting ARCADE pairs: {e}")
+    # CADICA
+    if "CADICA" in detect_datasets:
+        cadica_dir = os.path.join(root, "detect", "CADICA")
+        logger.info(f"Collecting CADICA detection: {cadica_dir}")
         try:
-            from PIL import Image
-            with Image.open(img_path) as img:
-                img.save(img_out_path)
-            with open(label_path, 'r') as fin, open(lbl_out_path, 'w') as fout:
-                fout.write(fin.read())
-            logger.debug(f"Saved {out_name_img} and {out_name_lbl}")
+            cadica_pairs = cadica.collect_image_label_pairs(cadica_dir, logger=logger)
+            for img_path, label_path, unique_name in cadica_pairs:
+                out_img = f"{unique_name}.png"
+                out_lbl = f"{unique_name}.txt"
+                img_out_path = angiography_detect_img / out_img
+                lbl_out_path = angiography_detect_lbl / out_lbl
+                try:
+                    from PIL import Image
+                    with Image.open(img_path) as img:
+                        img.save(img_out_path)
+                    with open(label_path) as fin, open(lbl_out_path, 'w') as fout:
+                        fout.write(fin.read())
+                except Exception as e:
+                    logger.error(f"[DETECT][CADICA] Error processing {img_path}: {e}")
         except Exception as e:
-            logger.error(f"Error processing {img_path} or {label_path}: {e}")
+            logger.error(f"Failed collecting CADICA pairs: {e}")
+
+    # ================= Retinography =================
+    # For now, only datasets with segmentation-like structure (image + mask) use collect_image_mask_pairs
+    retino_counter = 0
+    for dataset in retino_datasets:
+        ds_input = os.path.join(root, "retinography", dataset)
+        if dataset == "CHASEDB1":
+            logger.info(f"Collecting CHASEDB1: {ds_input}")
+            try:
+                pairs = chasedb1.collect_image_mask_pairs(ds_input)
+            except Exception as e:
+                logger.error(f"Failed collecting CHASEDB1 pairs: {e}")
+                continue
+        elif dataset == "DRIVE":
+            logger.info(f"Collecting DRIVE: {ds_input}")
+            try:
+                pairs = drive.collect_image_mask_pairs(ds_input)
+            except Exception as e:
+                logger.error(f"Failed collecting DRIVE pairs: {e}")
+                continue
+        elif dataset == "FIVES":
+            logger.info(f"Collecting FIVES: {ds_input}")
+            try:
+                # FIVES returns tuples with split and number
+                fives_pairs = fives.collect_image_mask_pairs(ds_input)  # (img, mask, split, number)
+            except Exception as e:
+                logger.error(f"Failed collecting FIVES pairs: {e}")
+                continue
+            # Naming: FIVES{split}_{number:originalDigits}
+            for img_path, mask_path, split, number in fives_pairs:
+                out_name = f"FIVES{split}_{number}.png"
+                img_out_path = retino_img_dir / out_name
+                mask_out_path = retino_lbl_dir / out_name
+                try:
+                    from PIL import Image
+                    with Image.open(img_path) as img:
+                        img.save(img_out_path)
+                    with Image.open(mask_path) as mask:
+                        mask.save(mask_out_path)
+                except Exception as e:
+                    logger.error(f"[RETINO][FIVES] Error processing {img_path}: {e}")
+            retino_counter += len(fives_pairs)
+            continue  # Skip generic handler below
+        else:
+            logger.warning(f"Retinography dataset not implemented: {dataset}")
+            continue
+        for idx, (img_path, mask_path) in enumerate(pairs, 1):
+            out_name = f"{dataset}_{retino_counter + idx:06d}.png"
+            img_out_path = retino_img_dir / out_name
+            mask_out_path = retino_lbl_dir / out_name
+            try:
+                from PIL import Image
+                with Image.open(img_path) as img:
+                    img.save(img_out_path)
+                with Image.open(mask_path) as mask:
+                    mask.save(mask_out_path)
+            except Exception as e:
+                logger.error(f"[RETINO][{dataset}] Error processing {img_path}: {e}")
+        retino_counter += len(pairs)
+    logger.info(f"Retinography: {retino_counter} pairs saved.")
+
+    logger.info("Data standardization completed.")
 
 if __name__ == "__main__":
     main()

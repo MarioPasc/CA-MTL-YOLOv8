@@ -5,7 +5,11 @@
 #   │   ├── dataset1
 #   │   ├── ...
 #   │   └── datasetN
-#   └── segment
+#   ├── segment
+#   │   ├── dataset1
+#   │   ├── ...
+#   │   └── datasetN
+#   └── retinography
 #       ├── dataset1
 #       ├── ...
 #       └── datasetN
@@ -19,6 +23,10 @@ segment_datasets:
   - FS-CAD
   - DCA1
   - XCAV
+retinography_datasets:
+  - DRIVE
+  - FIVES
+  - CHASEDB1
 # We have hard-coded the insides of the datasets. 
 # If you want to add your own dataset, you will need to modify the code.
 output_dir: /media/mpascual/PortableSSD/Coronariografías/processed_data
@@ -31,7 +39,7 @@ preprocessing:
   # CLAHE enchancement for contrast improvement
   clahe:
     enabled: true
-    apply_to: "segmentation" # "detection", "segmentation", "both"
+    apply_to: "segmentation" # "detection", "segmentation", "retinography", "all"
     window_size: 5
     sigma: 1.0
     clipLimit: 2.0
