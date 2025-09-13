@@ -36,6 +36,8 @@ from camtl_yolo.data.preprocess.tools.upsample_images import UpscaleConfig, upsc
 from camtl_yolo.data.preprocess.tools.downsample_images import DownsampleConfig, downsample_image
 from camtl_yolo.data.preprocess.tools.upsample_masks import MaskUpscaleConfig, upscale_mask
 from camtl_yolo.data.preprocess.tools.downsample_masks import MaskDownsampleConfig, downsample_mask
+from camtl_yolo.data.preprocess.tools.preprocess_fundus import preprocess as preprocess_fundus_fn, Cfg as FundusCfg
+from camtl_yolo.data.preprocess.tools.preprocess_xca import preprocess_xca, CfgXCA
 import numpy as np
 from PIL import Image
 
@@ -164,7 +166,64 @@ def run_preprocessing(output_dir: str, config: Dict, logger, num_workers: int | 
         logger.info("[pipeline] Preprocessing pipeline finished")
         return
 
-    # ---------- Step 2: Resize (upsample or downsample) BEFORE format conversion ----------
+    # ---------- Step 2: Modality-specific preprocessing (fundus, XCA) BEFORE resize ----------
+    # Fundus preprocessing (retinography images) if enabled
+    if prep_cfg.get('preprocess_fundus', False):
+        fundus_dir = out_root.joinpath(*RET_IMG)
+        if fundus_dir.exists():
+            logger.info('[pipeline] Applying fundus preprocessing to retinography images')
+            # Iterate PNG/JPG/TIF etc
+            fundus_exts = {'.png','.jpg','.jpeg','.tif','.tiff','.bmp'}
+            fcfg = FundusCfg()  # defaults; can later expose parameters
+            for img_path in fundus_dir.rglob('*'):
+                if not img_path.is_file() or img_path.suffix.lower() not in fundus_exts:
+                    continue
+                try:
+                    # read and process
+                    import cv2, numpy as _np
+                    raw = cv2.imread(str(img_path), cv2.IMREAD_UNCHANGED)
+                    if raw is None:
+                        logger.warning(f"[pipeline] Fundus read failed {img_path}")
+                        continue
+                    out = preprocess_fundus_fn(raw, fcfg, logger)
+                    cv2.imwrite(str(img_path), out)
+                except Exception as e:
+                    logger.error(f"[pipeline] Fundus preprocess failed {img_path}: {e}")
+        else:
+            logger.info('[pipeline] Retinography images directory missing; skipping fundus preprocessing.')
+
+    # XCA preprocessing (angiography) depending on config: none|segment|detect|both
+    xca_mode = prep_cfg.get('preprocess_xca', 'none')
+    if xca_mode and xca_mode.lower() != 'none':
+        targets = []
+        if xca_mode in ('segment','both'):
+            targets.append(out_root.joinpath(*SEG_IMG))
+        if xca_mode in ('detect','both'):
+            targets.append(out_root.joinpath(*DET_IMG))
+        xcfg = CfgXCA()  # defaults; could be extended via config later
+        for tdir in targets:
+            if not tdir.exists():
+                logger.info(f"[pipeline] XCA target dir missing ({tdir}); skipping")
+                continue
+            logger.info(f"[pipeline] Applying XCA preprocessing to {tdir}")
+            exts = {'.png','.jpg','.jpeg','.tif','.tiff','.bmp'}
+            for img_path in tdir.rglob('*'):
+                if not img_path.is_file() or img_path.suffix.lower() not in exts:
+                    continue
+                try:
+                    import cv2, numpy as _np
+                    g = cv2.imread(str(img_path), cv2.IMREAD_UNCHANGED)
+                    if g is None:
+                        logger.warning(f"[pipeline] XCA read failed {img_path}")
+                        continue
+                    if g.ndim == 3:
+                        g = cv2.cvtColor(g, cv2.COLOR_BGR2GRAY)
+                    out = preprocess_xca(g, xcfg)
+                    cv2.imwrite(str(img_path), out)
+                except Exception as e:
+                    logger.error(f"[pipeline] XCA preprocess failed {img_path}: {e}")
+
+    # ---------- Step 3: Resize (upsample or downsample) BEFORE format conversion ----------
     # Config structure (new): img_size: { target: [W,H], upsampling_strategy: str, mask_upsampling_strategy: str, mask_downsampling_strategy: str }
     img_size_cfg = prep_cfg.get('img_size')
     target_size = None
