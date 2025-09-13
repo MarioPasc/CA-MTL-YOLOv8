@@ -32,29 +32,51 @@ from typing import Dict, List, Tuple
 
 from camtl_yolo.data.preprocess.tools.img_format import convert_image
 from camtl_yolo.data.preprocess.tools.bbox_converter import convert_cadica_labels, convert_arcade_labels
+from camtl_yolo.data.preprocess.tools.upsample_images import UpscaleConfig, upscale_image
+from camtl_yolo.data.preprocess.tools.downsample_images import DownsampleConfig, downsample_image
+from camtl_yolo.data.preprocess.tools.upsample_masks import MaskUpscaleConfig, upscale_mask
+from camtl_yolo.data.preprocess.tools.downsample_masks import MaskDownsampleConfig, downsample_mask
+import numpy as np
+from PIL import Image
 
 # Dataset modality subpaths relative to output_dir
-SEG_IMG = ["angiographies", "segment", "images"]
-SEG_LBL = ["angiographies", "segment", "labels"]
-DET_IMG = ["angiographies", "detect", "images"]  # labels for detection are text, skip
+SEG_IMG = ["angiography", "segment", "images"]
+SEG_LBL = ["angiography", "segment", "labels"]
+DET_IMG = ["angiography", "detect", "images"]  # labels for detection are text, skip
 RET_IMG = ["retinography", "images"]
 RET_LBL = ["retinography", "labels"]
 
 IMAGE_DIRS = [SEG_IMG, SEG_LBL, DET_IMG, RET_IMG, RET_LBL]
 
 def _gather_all_images(root: Path) -> List[Path]:
+    """Return all image-like files (including masks) regardless of format."""
     paths: List[Path] = []
     for parts in IMAGE_DIRS:
         d = root.joinpath(*parts)
         if not d.exists():
             continue
         for fp in d.rglob('*'):
-            if fp.is_file():
-                # Skip detection label txt
-                if fp.suffix.lower() == '.txt':
-                    continue
-                paths.append(fp)
+            if not fp.is_file():
+                continue
+            if fp.suffix.lower() == '.txt':  # skip detection label text files
+                continue
+            paths.append(fp)
     return paths
+
+def _prepare_mask_array(arr, strategy: str):
+    """Ensure mask is 2D binary when required by skeleton-related strategies.
+    Strategies 'skeleton_preserve' (down) and 'skeleton_upscale' (up) expect a 2D binary mask.
+    If multi-channel, convert via mean across channels; then binarize >0.
+    """
+    strat = (strategy or '').lower()
+    if strat in ('skeleton_preserve', 'skeleton_upscale'):
+        import numpy as _np
+        if arr.ndim == 3:
+            # average across channels to get intensity map
+            arr = arr.mean(axis=2)
+        # Binarize: any positive value -> 1
+        arr = (_np.asarray(arr) > 0).astype('uint8')
+    return arr
 
 def _chunk(iterable, n):
     iterable = list(iterable)
@@ -76,7 +98,7 @@ def run_preprocessing(output_dir: str, config: Dict, logger, num_workers: int | 
     logger.info(f"[pipeline] Target image format: {target_fmt}")
     # ---------- Step 1: Detection label conversion (CADICA + ARCADE) ----------
     if prep_cfg.get('detect_labels_to_yolo', False):
-        detect_lbl_dir = out_root / 'angiographies' / 'detect' / 'labels'
+        detect_lbl_dir = out_root / 'angiography' / 'detect' / 'labels'
         if detect_lbl_dir.exists():
             # CADICA
             cadica_label_files = [p for p in detect_lbl_dir.glob('CADICAp*.txt')]
@@ -137,17 +159,123 @@ def run_preprocessing(output_dir: str, config: Dict, logger, num_workers: int | 
             logger.info('[pipeline] Detection labels directory missing; skipping label conversion.')
 
     all_images = _gather_all_images(out_root)
-    logger.info(f"[pipeline] Collected {len(all_images)} files for potential format conversion")
     if not all_images:
-        logger.info("[pipeline] Nothing to process.")
+        logger.info("[pipeline] No image files found; skipping resize + format stages.")
+        logger.info("[pipeline] Preprocessing pipeline finished")
         return
 
-    # ---------- Step 2: Image format conversion ----------
-    # Parallel convert
+    # ---------- Step 2: Resize (upsample or downsample) BEFORE format conversion ----------
+    # Config structure (new): img_size: { target: [W,H], upsampling_strategy: str, mask_upsampling_strategy: str, mask_downsampling_strategy: str }
+    img_size_cfg = prep_cfg.get('img_size')
+    target_size = None
+    if isinstance(img_size_cfg, dict) and 'target' in img_size_cfg:
+        ts = img_size_cfg.get('target')
+        if isinstance(ts, (list, tuple)) and len(ts) == 2:
+            try:
+                target_size = (int(ts[0]), int(ts[1]))
+            except Exception:
+                target_size = None
+    elif isinstance(img_size_cfg, (list, tuple)) and len(img_size_cfg) == 2:  # backward compatibility
+        try:
+            target_size = (int(img_size_cfg[0]), int(img_size_cfg[1]))
+        except Exception:
+            target_size = None
+
+    if target_size:
+        tw, th = target_size
+        upsample_queue: List[Path] = []
+        downsample_queue: List[Path] = []
+        # Determine if a path is mask (segmentation or retinography labels) by directory part 'labels' under segment or retinography
+        def is_mask(p: Path) -> bool:
+            parts = p.parts
+            return 'labels' in parts and ('segment' in parts or 'retinography' in parts)
+
+        for p in all_images:
+            try:
+                with Image.open(p) as im:
+                    w, h = im.size
+            except Exception:
+                logger.warning(f"[pipeline] Could not read size for {p}; skipping resize")
+                continue
+            if (w, h) == (tw, th):
+                continue
+            if w < tw or h < th:
+                upsample_queue.append(p)
+            else:
+                downsample_queue.append(p)
+
+        logger.info(f"[pipeline] Resize target={target_size}; upsample {len(upsample_queue)} | downsample {len(downsample_queue)}")
+
+        # Strategies
+        up_strategy: str = 'lanczos'
+        down_strategy: str = 'progressive'
+        mask_up_strategy: str = 'nearest'
+        mask_down_strategy: str = 'nearest'
+        if isinstance(img_size_cfg, dict):
+            up_strategy = str(img_size_cfg.get('upsampling_strategy', 'lanczos')).lower()
+            down_strategy = 'progressive'  # fixed as per comment
+            mask_down_strategy = str(img_size_cfg.get('mask_downsampling_strategy', 'nearest'))
+            mask_up_strategy = str(img_size_cfg.get('mask_upsampling_strategy', 'nearest'))
+
+        # Process upsample queue
+        for src in upsample_queue:
+            try:
+                if is_mask(src):
+                    # load as numpy
+                    with Image.open(src) as im:
+                        arr = np.array(im)
+                        arr = _prepare_mask_array(arr, mask_up_strategy)
+                        mu_cfg = MaskUpscaleConfig(target_size=target_size, strategy=mask_up_strategy)
+                        out_arr = upscale_mask(arr, (im.size[0], im.size[1]), mu_cfg)
+                        # save back (preserve single-channel if possible)
+                        out_im = Image.fromarray(out_arr)
+                        out_im.save(src)
+                else:
+                    # image upscale
+                    # Normalize possible enum-like name 'RES_LANCZOS'
+                    norm_up = 'lanczos' if up_strategy.lower().replace('res_', '') == 'lanczos' else up_strategy
+                    up_cfg = UpscaleConfig(target_size=target_size, strategy=norm_up)
+                    # Upscale writes to destination; use temp then replace
+                    tmp_dst = src.with_suffix('.tmp_upscale' + src.suffix)
+                    upscale_image(src, tmp_dst, up_cfg)
+                    # replace original
+                    tmp_dst.replace(src)
+            except Exception as e:
+                logger.error(f"[pipeline] Upscale failed for {src}: {e}")
+
+        # Process downsample queue
+        for src in downsample_queue:
+            try:
+                if is_mask(src):
+                    with Image.open(src) as im:
+                        arr = np.array(im)
+                        arr = _prepare_mask_array(arr, mask_down_strategy)
+                        md_cfg = MaskDownsampleConfig(target_size=target_size, method=mask_down_strategy)
+                        out_arr = downsample_mask(arr, (im.size[0], im.size[1]), md_cfg)  # type: ignore
+                        out_im = Image.fromarray(out_arr)
+                        out_im.save(src)
+                else:
+                    down_cfg = DownsampleConfig(target_size=target_size, strategy=down_strategy)
+                    tmp_dst = src.with_suffix('.tmp_downscale' + src.suffix)
+                    downsample_image(src, tmp_dst, down_cfg)
+                    tmp_dst.replace(src)
+            except Exception as e:
+                logger.error(f"[pipeline] Downscale failed for {src}: {e}")
+    else:
+        logger.info('[pipeline] No valid target img_size specified; skipping resize stage.')
+
+    # Filter for images not already in target format (after potential resize modifications)
+    to_convert: List[Path] = [p for p in all_images if p.suffix.lower() != target_fmt.lower()]
+    logger.info(f"[pipeline] Found {len(all_images)} total images; {len(to_convert)} require format conversion ({target_fmt})")
+    if not to_convert:
+        logger.info("[pipeline] All images already in target format; skipping conversion stage.")
+        logger.info("[pipeline] Preprocessing pipeline finished")
+        return
+
     successes = 0
     failures = 0
     with ProcessPoolExecutor(max_workers=num_workers) as ex:
-        futures = {ex.submit(convert_image, str(img), target_fmt, True, True, None): img for img in all_images}
+        futures = {ex.submit(convert_image, str(img), target_fmt, True, True, None): img for img in to_convert}
         for fut in as_completed(futures):
             img = futures[fut]
             try:
@@ -162,7 +290,7 @@ def run_preprocessing(output_dir: str, config: Dict, logger, num_workers: int | 
                 failures += 1
                 logger.error(f"[pipeline] Conversion failed {img}: {err}")
 
-    logger.info(f"[pipeline] Format conversion done. Success: {successes} Failed: {failures}")
+    logger.info(f"[pipeline] Format conversion done. Converted: {successes} Failed: {failures}")
     logger.info("[pipeline] Preprocessing pipeline finished")
 
 __all__ = ["run_preprocessing"]

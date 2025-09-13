@@ -38,7 +38,12 @@ preprocessing:
   # Detect Labels to
   detect_labels_to_yolo: true
   # Resize images to this size (width, height)
-  img_size: [512, 512]
+  img_size: 
+    target: [512, 512]
+    # downsampling_strategy fixed
+    upsampling_strategy: "RES_LANCZOS" 
+    mask_downsampling_strategy: "skeleton_preserve" # 'nearest'|'area'|'majority'|'perclass_area'|'skeleton_preserve'
+    mask_upsampling_strategy: "skeleton_upscale" #  'nearest'|'prob_bicubic'|'perclass_prob'|'nearest_dilate'|'skeleton_upscale'
   # Whether to convert images to grayscale
   to_gray: true
   # Data type
