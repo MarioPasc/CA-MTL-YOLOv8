@@ -77,105 +77,105 @@ void Image::preprocess(cv::Mat* img, std::vector<uint16_t>& triton_data, int inp
 int getDetectionsFromTritonRawData(std::vector<float>& detection_results, std::vector<struct detection_struct> &detections, std::vector<std::string>& object_class_list, float confidence_threshold, int image_width, int image_height)
 {
     const size_t shape[3] = {1, object_class_list.size()+4, 8400};
-	std::vector<BoundingBox> boxes;
+    std::vector<BoundingBox> boxes;
     for (size_t i = 0; i < shape[2]; i++)
     {
 
-		int x = int(detection_results[0 * shape[2] + i]);
-		int y = int(detection_results[1 * shape[2] + i]);
-		int w = int(detection_results[2 * shape[2] + i]);
-		int h = int(detection_results[3 * shape[2] + i]);
+        int x = int(detection_results[0 * shape[2] + i]);
+        int y = int(detection_results[1 * shape[2] + i]);
+        int w = int(detection_results[2 * shape[2] + i]);
+        int h = int(detection_results[3 * shape[2] + i]);
 
-		for(size_t j =0 ; j < object_class_list.size(); j++)
-		{
-			if (detection_results[(4+j) * shape[2] + i] > 0.01)
-			{
-				BoundingBox box;
-				box.x = static_cast<float>(x);
-				box.y = static_cast<float>(y);
-				box.w = static_cast<float>(w);
-				box.h = static_cast<float>(h);
-				box.score = detection_results[(4 + j) * shape[2] + i];
-				box.class_id = j;
-				boxes.push_back(box);
-			}
+        for(size_t j =0 ; j < object_class_list.size(); j++)
+        {
+            if (detection_results[(4+j) * shape[2] + i] > 0.01)
+            {
+                BoundingBox box;
+                box.x = static_cast<float>(x);
+                box.y = static_cast<float>(y);
+                box.w = static_cast<float>(w);
+                box.h = static_cast<float>(h);
+                box.score = detection_results[(4 + j) * shape[2] + i];
+                box.class_id = j;
+                boxes.push_back(box);
+            }
 
-		}
+        }
 
     }
-	auto nms_boxes = NMS(boxes, IOU_THRESHOLD);
-	detections.clear();
-	if(nms_boxes.size()==0)
-	{
-		return 0;
-	}
-	float scale_x = 0.0;
-	float scale_y = 0.0;
+    auto nms_boxes = NMS(boxes, IOU_THRESHOLD);
+    detections.clear();
+    if(nms_boxes.size()==0)
+    {
+        return 0;
+    }
+    float scale_x = 0.0;
+    float scale_y = 0.0;
 
-	int x1,y1 = 0;
-	int x2,y2 = 0;
+    int x1,y1 = 0;
+    int x2,y2 = 0;
 
-	float shift_factor_x = 0.6;
+    float shift_factor_x = 0.6;
     float shift_factor_y = 0.5;
 
-	int offset_shift = (image_width/640.0f)*10;
+    int offset_shift = (image_width/640.0f)*10;
 
-	if (image_width<=640)
-	{
-		scale_x = static_cast<float>(image_width - 640.0f ) * 0.5 ;
-		scale_y = static_cast<float>(image_height - 640.0f) * 0.5 ;
-	}
-	for (size_t i = 0; i < nms_boxes.size(); ++i)
-	{
-		if (nms_boxes[i].score< confidence_threshold)
-		{
-			continue;
-		}
-		struct detection_struct tespit_yapi ;
-		detections.push_back(tespit_yapi);
-		detections[detections.size() - 1].confidence_score = nms_boxes[i].score;
-		if (image_width==640)
-		{
-			scale_x = static_cast<float>(image_width - 640.0f ) * 0.5 ;
-			scale_y = static_cast<float>(image_height - 640.0f) * 0.5 ;
-			x1 = static_cast<int>((nms_boxes[i].x - nms_boxes[i].w/2) + scale_x);
-			y1 = static_cast<int>((nms_boxes[i].y - nms_boxes[i].h/2) + scale_y) ;
-			x2 = static_cast<int>((nms_boxes[i].x + nms_boxes[i].w/2) + scale_x);
-			y2 = static_cast<int>((nms_boxes[i].y + nms_boxes[i].h/2) + scale_y);
-		}
-		else if(image_width>=1080)
-		{
-			x1 = static_cast<int>((nms_boxes[i].x - nms_boxes[i].w/2) * (image_width/640) );
-			y1 = static_cast<int>((nms_boxes[i].y - nms_boxes[i].h/2) * (image_width/640) - ((image_width - image_height) / 2.0)) ;
-			x2 = static_cast<int>((nms_boxes[i].x + nms_boxes[i].w/2) * (image_width/640) );
-			y2 = static_cast<int>((nms_boxes[i].y + nms_boxes[i].h/2) * (image_width/640)- ((image_width - image_height) / 2.0));
-		}
+    if (image_width<=640)
+    {
+        scale_x = static_cast<float>(image_width - 640.0f ) * 0.5 ;
+        scale_y = static_cast<float>(image_height - 640.0f) * 0.5 ;
+    }
+    for (size_t i = 0; i < nms_boxes.size(); ++i)
+    {
+        if (nms_boxes[i].score< confidence_threshold)
+        {
+            continue;
+        }
+        struct detection_struct tespit_yapi ;
+        detections.push_back(tespit_yapi);
+        detections[detections.size() - 1].confidence_score = nms_boxes[i].score;
+        if (image_width==640)
+        {
+            scale_x = static_cast<float>(image_width - 640.0f ) * 0.5 ;
+            scale_y = static_cast<float>(image_height - 640.0f) * 0.5 ;
+            x1 = static_cast<int>((nms_boxes[i].x - nms_boxes[i].w/2) + scale_x);
+            y1 = static_cast<int>((nms_boxes[i].y - nms_boxes[i].h/2) + scale_y) ;
+            x2 = static_cast<int>((nms_boxes[i].x + nms_boxes[i].w/2) + scale_x);
+            y2 = static_cast<int>((nms_boxes[i].y + nms_boxes[i].h/2) + scale_y);
+        }
+        else if(image_width>=1080)
+        {
+            x1 = static_cast<int>((nms_boxes[i].x - nms_boxes[i].w/2) * (image_width/640) );
+            y1 = static_cast<int>((nms_boxes[i].y - nms_boxes[i].h/2) * (image_width/640) - ((image_width - image_height) / 2.0)) ;
+            x2 = static_cast<int>((nms_boxes[i].x + nms_boxes[i].w/2) * (image_width/640) );
+            y2 = static_cast<int>((nms_boxes[i].y + nms_boxes[i].h/2) * (image_width/640)- ((image_width - image_height) / 2.0));
+        }
 
-		float x_center, y_center, width, height;
-		x_center = (x1 + x2) / 2.0f;
-		y_center = (y1 + y2) / 2.0f;
-		width = x2 - x1;
-		height = y2 - y1;
-		detections[detections.size() - 1].bbox.x = x_center - width/2 ;
-		detections[detections.size() - 1].bbox.y = y_center - height/2;
-		detections[detections.size() - 1].bbox.width  = width ;
-		detections[detections.size() - 1].bbox.height =  height;
-		if (detections[detections.size() - 1].bbox.x <= 0)
-			detections[detections.size() - 1].bbox.x = offset_shift;
-		if (detections[detections.size() - 1].bbox.y <= 0)
-			detections[detections.size() - 1].bbox.y = offset_shift;
-		if (detections[detections.size() - 1].bbox.x + detections[detections.size() - 1].bbox.width  >= image_width)
-		{
-			detections[detections.size() - 1].bbox.width  -= detections[detections.size() - 1].bbox.x + detections[detections.size() - 1].bbox.width  - image_width + offset_shift ;
-		}
-		if (detections[detections.size() - 1].bbox.y + detections[detections.size() - 1].bbox.height >= image_height)
-		{
-			detections[detections.size() - 1].bbox.height -= detections[detections.size() - 1].bbox.y + detections[detections.size() - 1].bbox.height - image_height + offset_shift ;
-		}
-		detections[detections.size() - 1].name = object_class_list[nms_boxes[i].class_id];
-		detections[detections.size() - 1].class_id = nms_boxes[i].class_id;
-	}
-	return 0;
+        float x_center, y_center, width, height;
+        x_center = (x1 + x2) / 2.0f;
+        y_center = (y1 + y2) / 2.0f;
+        width = x2 - x1;
+        height = y2 - y1;
+        detections[detections.size() - 1].bbox.x = x_center - width/2 ;
+        detections[detections.size() - 1].bbox.y = y_center - height/2;
+        detections[detections.size() - 1].bbox.width  = width ;
+        detections[detections.size() - 1].bbox.height =  height;
+        if (detections[detections.size() - 1].bbox.x <= 0)
+            detections[detections.size() - 1].bbox.x = offset_shift;
+        if (detections[detections.size() - 1].bbox.y <= 0)
+            detections[detections.size() - 1].bbox.y = offset_shift;
+        if (detections[detections.size() - 1].bbox.x + detections[detections.size() - 1].bbox.width  >= image_width)
+        {
+            detections[detections.size() - 1].bbox.width  -= detections[detections.size() - 1].bbox.x + detections[detections.size() - 1].bbox.width  - image_width + offset_shift ;
+        }
+        if (detections[detections.size() - 1].bbox.y + detections[detections.size() - 1].bbox.height >= image_height)
+        {
+            detections[detections.size() - 1].bbox.height -= detections[detections.size() - 1].bbox.y + detections[detections.size() - 1].bbox.height - image_height + offset_shift ;
+        }
+        detections[detections.size() - 1].name = object_class_list[nms_boxes[i].class_id];
+        detections[detections.size() - 1].class_id = nms_boxes[i].class_id;
+    }
+    return 0;
 }
 
 

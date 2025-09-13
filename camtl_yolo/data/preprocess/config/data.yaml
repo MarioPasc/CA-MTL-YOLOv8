@@ -35,14 +35,14 @@ output_dir: /media/mpascual/PortableSSD/Coronariografías/processed_data
 preprocessing:
   # Image format
   img_format: png
+  # Detect Labels to
+  detect_labels_to_yolo: true
   # Resize images to this size (width, height)
-  img_size: [640, 640]
+  img_size: [512, 512]
   # Whether to convert images to grayscale
   to_gray: true
   # Data type
   dtype: uint8
-  # Detect Labels to
-  detect_labels_to_yolo: true
   # CLAHE enchancement for contrast improvement
   clahe:
     enabled: false

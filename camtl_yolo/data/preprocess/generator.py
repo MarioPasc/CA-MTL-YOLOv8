@@ -3,7 +3,7 @@
 Target standardized structure (under output_dir):
 
 output_dir/
-    angiographies/
+    angiography/
         segment/
             images/
             labels/
@@ -67,10 +67,10 @@ def main():
         return
 
     # Prepare target directory tree
-    angiography_segment_img = Path(output_dir) / "angiographies" / "segment" / "images"
-    angiography_segment_lbl = Path(output_dir) / "angiographies" / "segment" / "labels"
-    angiography_detect_img = Path(output_dir) / "angiographies" / "detect" / "images"
-    angiography_detect_lbl = Path(output_dir) / "angiographies" / "detect" / "labels"
+    angiography_segment_img = Path(output_dir) / "angiography" / "segment" / "images"
+    angiography_segment_lbl = Path(output_dir) / "angiography" / "segment" / "labels"
+    angiography_detect_img = Path(output_dir) / "angiography" / "detect" / "images"
+    angiography_detect_lbl = Path(output_dir) / "angiography" / "detect" / "labels"
     retino_img_dir = Path(output_dir) / "retinography" / "images"
     retino_lbl_dir = Path(output_dir) / "retinography" / "labels"
     for p in [angiography_segment_img, angiography_segment_lbl,
@@ -104,7 +104,7 @@ def main():
     else:
         logger.info("[generator] Starting dataset reordering phase.")
 
-    # ================= Segment (Angiographies) =================
+    # ================= Segment (angiography) =================
     all_seg_pairs: List[Tuple[str, str, str]] = []  # (img, mask, dataset_name)
     if not ordering_already_done:
         for dataset in segment_datasets:
@@ -136,17 +136,19 @@ def main():
                     mask.save(mask_out_path)
             except Exception as e:
                 logger.error(f"[SEG] Error processing {img_path} or {mask_path}: {e}")
-        logger.info(f"Segmentation (angiographies): {len(all_seg_pairs)} pairs saved.")
+        logger.info(f"Segmentation (angiography): {len(all_seg_pairs)} pairs saved.")
 
-    # ================= Detection (Angiographies) =================
+    # ================= Detection (angiography) =================
     from camtl_yolo.data.preprocess.modules import arcade_stenosis, cadica
     if not ordering_already_done:
         # ARCADE
+        detection_counter: int = 0
         if "ARCADE" in detect_datasets:
             arcade_dir = _resolve_path("angiography", "detect", "ARCADE")
             logger.info(f"Collecting ARCADE detection: {arcade_dir}")
             try:
                 arcade_pairs = arcade_stenosis.collect_image_label_pairs(arcade_dir)
+                detection_counter += len(arcade_pairs)
                 for img_path, label_path, split, number in arcade_pairs:
                     out_img = f"ARCADE{split}_{number}.png"
                     out_lbl = f"ARCADE{split}_{number}.txt"
@@ -168,6 +170,7 @@ def main():
             logger.info(f"Collecting CADICA detection: {cadica_dir}")
             try:
                 cadica_pairs = cadica.collect_image_label_pairs(cadica_dir, logger=logger)
+                detection_counter += len(cadica_pairs)
                 for img_path, label_path, unique_name in cadica_pairs:
                     out_img = f"{unique_name}.png"
                     out_lbl = f"{unique_name}.txt"
@@ -183,7 +186,7 @@ def main():
                         logger.error(f"[DETECT][CADICA] Error processing {img_path}: {e}")
             except Exception as e:
                 logger.error(f"Failed collecting CADICA pairs: {e}")
-
+        logger.info(f"Detection (angiography): {detection_counter} pairs saved.")
     # ================= Retinography =================
     # For now, only datasets with segmentation-like structure (image + mask) use collect_image_mask_pairs
     retino_counter = 0

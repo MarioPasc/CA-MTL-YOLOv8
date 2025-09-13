@@ -42,7 +42,7 @@ typedef struct _DL_INIT_PARAM
     std::vector<int> imgSize = { 640, 640 };
     float rectConfidenceThreshold = 0.6;
     float iouThreshold = 0.5;
-    int	keyPointsNum = 2;//Note:kpt number for pose
+    int    keyPointsNum = 2;//Note:kpt number for pose
     bool cudaEnable = false;
     int logSeverityLevel = 3;
     int intraOpNumThreads = 1;

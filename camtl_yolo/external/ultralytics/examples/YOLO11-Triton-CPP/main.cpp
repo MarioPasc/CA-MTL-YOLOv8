@@ -27,9 +27,9 @@ int main(int argc, char *argv[])
     std::string triton_address= "localhost:8001";
     std::string model_name= "yolo11";
     std::string model_version= "1";
-	std::string image_path = "test.jpg";
-	std::string output_path = "output.jpg";
-	std::vector<std::string> object_class_list = {"class1", "class2"};
+    std::string image_path = "test.jpg";
+    std::string output_path = "output.jpg";
+    std::vector<std::string> object_class_list = {"class1", "class2"};
 
     std::vector<uint16_t> triton_request_data;
     triton_request_data.resize(IMAGE_CHANNEL*MODEL_INPUT_IMAGE_WIDTH*MODEL_INPUT_IMAGE_HEIGHT);
@@ -48,7 +48,7 @@ int main(int argc, char *argv[])
     int image_height = frame.rows;
 
     double preprocess_time = get_time_since_epoch_millis();
-	Image::preprocess(&frame, triton_request_data, MODEL_INPUT_IMAGE_WIDTH, MODEL_INPUT_IMAGE_HEIGHT);
+    Image::preprocess(&frame, triton_request_data, MODEL_INPUT_IMAGE_WIDTH, MODEL_INPUT_IMAGE_HEIGHT);
     std::cout << "Preprocess time : " << (get_time_since_epoch_millis() - preprocess_time)<< " millisecond."<< std::endl;
 
     double infer_time = get_time_since_epoch_millis();
