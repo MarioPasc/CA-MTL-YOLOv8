@@ -46,8 +46,10 @@ preprocessing:
     mask_upsampling_strategy: "skeleton_upscale" #  'nearest'|'prob_bicubic'|'perclass_prob'|'nearest_dilate'|'skeleton_upscale'
   # Process retinal images to enhance contrast? - Mandatory, but I put this here
   # so that we know its happening
-  preprocess_fundus: true
-  # Process angiography images to enhance contrast in the segmentation task? - Optional
-  preprocess_xca: "none" # options: "none", "detect", "segment", "both"
+  preprocessing:
+    fundus: true
+    extract_fov: true   # leave images untouched
+    # Process angiography images to enhance contrast in the segmentation task? - Optional
+    xca: "none" # options: "none", "detect", "segment", "both"
   # Data type
   dtype: uint8

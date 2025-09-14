@@ -119,7 +119,7 @@ def upscale_mask(mask: np.ndarray, src_size: Tuple[int, int], cfg: MaskUpscaleCo
     - src_size: (width, height) of source image (used only for checks).
     - cfg: MaskUpscaleConfig
     """
-    logger.info("upscale_mask strategy=%s src_size=%s target=%s", cfg.strategy, src_size, cfg.target_size)
+    logger.debug("upscale_mask strategy=%s src_size=%s target=%s", cfg.strategy, src_size, cfg.target_size)
     strat = cfg.strategy.lower()
     if strat == "nearest":
         return upscale_nearest(mask, cfg.target_size)

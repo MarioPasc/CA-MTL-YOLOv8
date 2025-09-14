@@ -103,7 +103,7 @@ def downsample_image(src: Path, dst: Path, cfg: DownsampleConfig) -> None:
         with Image.open(src) as im:
             im = im.convert("RGB")  # normalize mode
             orig_size = im.size
-            logger.info("src=%s orig=%s target=%s strategy=%s", src.name, orig_size, cfg.target_size, cfg.strategy)
+            logger.debug("src=%s orig=%s target=%s strategy=%s", src.name, orig_size, cfg.target_size, cfg.strategy)
             if cfg.strategy == "progressive":
                 out = progressive_downsample(im, cfg.target_size, cfg.max_progressive_factor)
             elif cfg.strategy == "gauss_lanczos":
@@ -113,7 +113,7 @@ def downsample_image(src: Path, dst: Path, cfg: DownsampleConfig) -> None:
             else:
                 raise ImageProcessingError(f"unknown strategy: {cfg.strategy}")
             out.save(dst, format="PNG")
-            logger.info("wrote %s (size=%s)", dst, out.size)
+            logger.debug("wrote %s (size=%s)", dst, out.size)
     except Exception as e:
         raise ImageProcessingError(str(e)) from e
 

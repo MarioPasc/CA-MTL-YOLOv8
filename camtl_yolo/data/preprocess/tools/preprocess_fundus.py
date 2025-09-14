@@ -20,11 +20,13 @@ References:
 
 from __future__ import annotations
 import argparse, glob, logging, os
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Iterable, Optional, Tuple
 
 import cv2
 import numpy as np
+
 
 @dataclass(frozen=True)
 class Cfg:
@@ -60,25 +62,6 @@ def to_gray(img:np.ndarray, use_green:bool)->np.ndarray:
         mn, mx = float(g.min()), float(g.max())
         g = np.zeros_like(g, dtype=np.uint8) if mx<=mn else _to_uint8(255*(g-mn)/(mx-mn))
     return g
-
-def fov_mask_from_raw(gray:np.ndarray)->np.ndarray:
-    """
-    Binary FOV from raw grayscale:
-      Gaussian blur → Otsu → keep largest component → morphological close → return bool
-    """
-    g = cv2.GaussianBlur(gray, (0,0), 3.0)
-    _,thr = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
-    m1 = thr>0; m2 = ~m1
-    mask = m1 if np.count_nonzero(m1)>=np.count_nonzero(m2) else m2
-    mask = mask.astype(np.uint8)*255
-    num, labels = cv2.connectedComponents(mask)
-    if num>1:
-        counts = np.bincount(labels.ravel()); counts[0]=0
-        keep = counts.argmax()
-        mask = (labels==keep).astype(np.uint8)*255
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE,
-                            cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(11,11)))
-    return mask>0
 
 # -------- Foracchia-style normalization --------
 
@@ -141,12 +124,194 @@ def gamma_corr(gray:np.ndarray, gamma:float)->np.ndarray:
     lut = ((np.arange(256)/255.0)**inv*255.0).astype(np.uint8)
     return cv2.LUT(gray,lut)
 
+def fov_mask_from_raw(img: np.ndarray,
+                      border_bg: int = 25,
+                      erode_fg: int = 35,
+                      iters: int = 5,
+                      log: Optional[logging.Logger] = None) -> np.ndarray:
+    """
+    Robust FOV via seeded GrabCut + optional ellipse regularization.
+
+    Seeds:
+      - Background: a 'border_bg' wide frame and the dark corners.
+      - Foreground: eroded coarse fundus from saturation ∪ red channel.
+
+    Steps:
+      1) Build coarse mask: Otsu on blurred Saturation and Red; union + largest CC.
+      2) Create GrabCut label map: definite BG on borders, definite FG on eroded coarse mask.
+      3) Run GrabCut (INIT_WITH_MASK).
+      4) Clean: largest CC, fill small holes, close.
+      5) Fit ellipse to contour; intersect with GrabCut mask only if it *expands* locally.
+
+    Returns bool mask (True = inside FOV).
+    References: GrabCut graph-cut segmentation. OpenCV ellipse fitting. Foracchia normalization. 
+    """
+    if img.ndim == 2:
+        bgr = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        gray = img
+    else:
+        bgr = img
+        gray = bgr[:, :, 1]
+
+    H, W = gray.shape
+    # --- coarse mask from color cues ---
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    S = cv2.GaussianBlur(hsv[:, :, 1], (0, 0), 5)
+    R = cv2.GaussianBlur(bgr[:, :, 2], (0, 0), 5)
+    _, thS = cv2.threshold(S, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    _, thR = cv2.threshold(R, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    coarse = cv2.morphologyEx(cv2.bitwise_or(thS, thR), cv2.MORPH_CLOSE,
+                              cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21)))
+    # keep largest CC
+    num, lab = cv2.connectedComponents(coarse)
+    if num > 1:
+        cnt = np.bincount(lab.ravel()); cnt[0] = 0
+        coarse = (lab == cnt.argmax()).astype(np.uint8) * 255
+
+    # --- GrabCut seeds ---
+    mask = np.full((H, W), cv2.GC_PR_BGD, np.uint8)
+    # definite background frame
+    mask[:border_bg, :] = cv2.GC_BGD
+    mask[-border_bg:, :] = cv2.GC_BGD
+    mask[:, :border_bg] = cv2.GC_BGD
+    mask[:, -border_bg:] = cv2.GC_BGD
+    # corners as BG
+    rr = border_bg
+    mask[:rr, :rr] = cv2.GC_BGD; mask[:rr, -rr:] = cv2.GC_BGD
+    mask[-rr:, :rr] = cv2.GC_BGD; mask[-rr:, -rr:] = cv2.GC_BGD
+    # definite foreground from eroded coarse mask
+    er = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (max(3, erode_fg)|1,)*2)
+    fg_seed = cv2.erode(coarse, er)
+    mask[fg_seed > 0] = cv2.GC_FGD
+
+    bgdModel = np.zeros((1, 65), np.float64)
+    fgdModel = np.zeros((1, 65), np.float64)
+    cv2.grabCut(bgr, mask, None, bgdModel, fgdModel, iters, cv2.GC_INIT_WITH_MASK)
+    gc = np.where((mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 1, 0).astype(np.uint8) * 255
+
+    # --- clean up ---
+    gc = cv2.morphologyEx(gc, cv2.MORPH_CLOSE,
+                          cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (19, 19)))
+    num, lab = cv2.connectedComponents(gc)
+    if num > 1:
+        cnt = np.bincount(lab.ravel()); cnt[0] = 0
+        gc = (lab == cnt.argmax()).astype(np.uint8) * 255
+    # fill holes
+    inv = cv2.bitwise_not(gc)
+    num, lab = cv2.connectedComponents(inv)
+    for k in range(1, num):
+        hole = (lab == k)
+        if hole.sum() < 0.02 * (gc > 0).sum():
+            gc[hole] = 255
+
+    fov_gc = gc > 0
+
+    # --- optional ellipse regularization ---
+    cnts, _ = cv2.findContours(gc, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if cnts and len(cnts[0]) >= 5:
+        (cx, cy), (MA, ma), ang = cv2.fitEllipseAMS(cnts[0])  # robust variant
+        ell = np.zeros_like(gc)
+        cv2.ellipse(ell, ((cx, cy), (MA, ma), ang), 255, -1)
+        ell = ell > 0
+        # intersect only where ellipse expands mask by <= 2% area
+        if ell.sum() <= 1.02 * fov_gc.sum():
+            fov = ell & (cv2.dilate(fov_gc.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0)
+        else:
+            fov = fov_gc
+    else:
+        fov = fov_gc
+
+    if log:
+        log.debug("GrabCut FOV: area=%.3f, seeds fg=%d, params border_bg=%d erode_fg=%d",
+                  fov.mean(), int((fg_seed > 0).sum()), border_bg, erode_fg)
+    return fov
+
+def _largest_cc_bool(bw: np.ndarray) -> np.ndarray:
+    num, lab = cv2.connectedComponents(bw.astype(np.uint8))
+    if num <= 1: 
+        return bw.astype(bool)
+    cnt = np.bincount(lab.ravel()); cnt[0] = 0
+    return (lab == cnt.argmax())
+
+def fov_mask_fallback_strict(img: np.ndarray) -> np.ndarray:
+    """
+    Stricter, color-aware fallback:
+      - Use red-band + triangle threshold (more conservative than Otsu on bright lesions),
+      - Union with saturation-threshold mask,
+      - Keep largest CC, close, fill tiny holes.
+    """
+    if img.ndim == 2:
+        bgr = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    else:
+        bgr = img
+    R = cv2.GaussianBlur(bgr[:, :, 2], (0, 0), 7)
+    S = cv2.GaussianBlur(cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)[:, :, 1], (0, 0), 7)
+
+    # Triangle threshold is conservative for unimodal backgrounds
+    _, thR = cv2.threshold(R, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_TRIANGLE)
+    _, thS = cv2.threshold(S, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    m = cv2.bitwise_or(thR, thS)
+
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE,
+                         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21)))
+    m = _largest_cc_bool(m > 0)
+    # fill small holes
+    inv = (~m).astype(np.uint8)
+    n, lab = cv2.connectedComponents(inv)
+    area = m.sum()
+    for k in range(1, n):
+        hole = (lab == k)
+        if hole.sum() < 0.01 * area:
+            m[hole] = True
+    return m
+
 # -------- Orchestrator --------
+
+def preprocess_with_mask(img: np.ndarray, cfg: Cfg, log: logging.Logger
+                         ) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Same as preprocess(), but also returns the boolean FOV mask used.
+    On failure patterns (implausible area), retries with a stricter fallback.
+    """
+    g0 = to_gray(img, cfg.use_green)
+    fov = fov_mask_from_raw(img=g0, log=log)
+
+    # sanity: FOV area must be in [0.30, 0.80]
+    a = fov.mean()
+    if not (0.30 <= a <= 0.80):
+        if log: log.debug(f"[fundus] FOV area {a:.3f} out of range; retrying with strict fallback")
+        fov = fov_mask_fallback_strict(img)
+
+    # the remainder mirrors preprocess()
+    if cfg.normalize.lower() == "foracchia":
+        g = foracchia_normalize(
+            g0, fov,
+            sigma_lum=cfg.sigma_lum,
+            sigma_con=cfg.sigma_con,
+            target_mean=cfg.target_mean,
+            target_std=cfg.target_std
+        )
+        if cfg.clip_limit > 0:
+            g = clahe(g, cfg.clip_limit, cfg.tile_grid)
+    else:
+        g = shade_correction(g0, cfg.shade_ksize)
+        g = clahe(g, cfg.clip_limit, cfg.tile_grid)
+
+    g = denoise_median(g, cfg.median_ksize)
+    g = gamma_corr(g, cfg.gamma)
+
+    if cfg.resize_to:
+        g   = cv2.resize(g, cfg.resize_to, interpolation=cv2.INTER_AREA)
+        fov = cv2.resize(fov.astype(np.uint8)*255, cfg.resize_to,
+                         interpolation=cv2.INTER_NEAREST) > 0
+
+    g[~fov] = 0
+    return _to_uint8(g), fov
 
 def preprocess(img:np.ndarray, cfg:Cfg, log:logging.Logger)->np.ndarray:
     g0 = to_gray(img, cfg.use_green)
-    fov = fov_mask_from_raw(g0)
-
+    fov = fov_mask_from_raw(img=g0, log=log)
+    
     if cfg.normalize.lower() == "foracchia":
         g = foracchia_normalize(
             g0, fov,
@@ -172,6 +337,30 @@ def preprocess(img:np.ndarray, cfg:Cfg, log:logging.Logger)->np.ndarray:
 
     g[~fov] = 0
     return _to_uint8(g)
+
+# ---------- QC + retry helpers ----------
+
+def mask_metrics(fov: np.ndarray) -> tuple[float, float, float]:
+    """Return (area_frac, compactness, hole_ratio) for a boolean FOV."""
+    h, w = fov.shape
+    A = float(np.count_nonzero(fov))
+    area_frac = A / float(h*w)
+    if A <= 0:
+        return 0.0, 0.0, 1.0
+    cnts, _ = cv2.findContours(fov.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    per = cv2.arcLength(cnts[0], True) if cnts else 1.0
+    compact = float(4.0*np.pi*A / max(per*per, 1.0))
+    # holes
+    inv = (~fov).astype(np.uint8)
+    n, lab = cv2.connectedComponents(inv)
+    hole_area = 0
+    for k in range(1, n):
+        hole = (lab == k)
+        # count only holes fully inside
+        if 0 < hole.sum() < (h*w) and not (hole[0,:].any() or hole[-1,:].any() or hole[:,0].any() or hole[:,-1].any()):
+            hole_area += int(hole.sum())
+    hole_ratio = float(hole_area) / max(A, 1.0)
+    return area_frac, max(0.0, min(1.0, compact)), hole_ratio
 
 def _iter_inputs(inp:str):
     if os.path.isdir(inp):

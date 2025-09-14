@@ -119,7 +119,7 @@ def upscale_image(src: Path, dst: Path, cfg: UpscaleConfig) -> None:
             orig_size = im.size
             _validate_target(orig_size, cfg.target_size)
             scale = _compute_scale(orig_size, cfg.target_size)
-            logger.info("Upscale: src=%s orig=%s target=%s scale=%.3f strategy=%s", src.name, orig_size, cfg.target_size, scale, cfg.strategy)
+            logger.debug("Upscale: src=%s orig=%s target=%s scale=%.3f strategy=%s", src.name, orig_size, cfg.target_size, scale, cfg.strategy)
 
             if cfg.strategy == "lanczos":
                 out = upscale_lanczos(im, cfg.target_size)
@@ -131,7 +131,7 @@ def upscale_image(src: Path, dst: Path, cfg: UpscaleConfig) -> None:
                 raise UpscaleError(f"unknown strategy: {cfg.strategy}")
 
             out.save(dst, format="PNG")
-            logger.info("Wrote upscaled image %s size=%s", dst, out.size)
+            logger.debug("Wrote upscaled image %s size=%s", dst, out.size)
     except UpscaleError:
         raise
     except Exception as exc:

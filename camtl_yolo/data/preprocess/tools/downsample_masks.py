@@ -132,7 +132,7 @@ def downsample_majority(mask: np.ndarray, target: Tuple[int,int]) -> np.ndarray:
     int_factors = _is_integer_factor((src_w, src_h), (tw, th))
     if not int_factors:
         # fallback: use area/per-class approach
-        logger.info("majority fallback to perclass_area (non-integer factors)")
+        logger.debug("majority fallback to perclass_area (non-integer factors)")
         return downsample_perclass_area(mask, target)
     fx, fy = int_factors
     if fx > 1000 or fy > 1000:
@@ -192,28 +192,69 @@ def downsample_perclass_area(mask: np.ndarray, target: Tuple[int,int]) -> np.nda
     return vec.astype(mask.dtype)
 
 
-def downsample_skeleton_preserve(mask: np.ndarray, target: Tuple[int,int], dilation_radius: int = 1) -> np.ndarray:
+def downsample_skeleton_preserve(mask: np.ndarray,
+                                 target: Tuple[int, int],
+                                 dilation_radius: int = 0) -> np.ndarray:
     """
-    Preserve thin structures:
-      1) skeletonize binary mask
-      2) downsample skeleton with nearest
-      3) dilate to recover approximate thickness
-    Works only for binary masks.
+    SDF-guided downsampling for binary vessel masks.
+
+    Steps:
+      1) Compute signed distance field (SDF) of the binary mask.
+         Positive inside vessels, negative outside.
+      2) Anti-aliased resize of the SDF to target size (linear interpolation).
+      3) Threshold the resized SDF at 0 to recover a binary mask.
+      4) Optional light dilation to compensate subpixel thinning (radius in px).
+
+    Args:
+        mask: 2D numpy array. Binary mask where vessels > 0.
+        target: (width, height) of the downsampled mask.
+        dilation_radius: Optional post-threshold dilation radius (pixels) at
+                         target scale. Use 0 to disable.
+
+    Returns:
+        2D uint8 array with shape (target_height, target_width).
+
+    Notes:
+        - SDF resampling preserves topology and subpixel centerlines under
+          downscale better than skeletonize→nearest→dilate.
+        - If input is empty or full, behavior is stable by construction.
+        
+    Maurer et al., A Linear Time Algorithm for Computing Exact Euclidean Distance Transforms of Binary Images, IEEE TPAMI 2003; 
+    Sethian, Level Set Methods and Fast Marching Methods, 1999; 
+    Kervadec et al., Boundary Loss for Highly Unbalanced Segmentation, MICCAI 2019.
     """
     _check_dependencies()
-    if skeletonize is None or binary_dilation is None or disk is None:
-        raise MaskDownsampleError("skimage.morphology required for skeleton_preserve")
     if mask.ndim != 2:
         raise MaskDownsampleError("skeleton_preserve supports 2D binary masks only")
-    # ensure binary dtype
+
+    # ensure binary float mask
     bin_mask = (mask > 0).astype(np.uint8)
-    ske = skeletonize(bin_mask)
-    # nearest downsample skeleton (to preserve exact pixels where possible)
-    ske_ds = resize(ske.astype(np.float32), (target[1], target[0]), order=0, preserve_range=True, anti_aliasing=False)
-    # dilate skeleton to re-expand thin shapes
-    selem = disk(dilation_radius)
-    dil = binary_dilation(ske_ds.astype(bool), selem)
-    return dil.astype(np.uint8)
+
+    # compute signed distance: inside minus outside
+    # exact Euclidean distance transforms (O(N)) via SciPy
+    dist_in = ndi.distance_transform_edt(bin_mask)          # distance to background
+    dist_out = ndi.distance_transform_edt(1 - bin_mask)     # distance to foreground
+    sdf = dist_in - dist_out                                # >0 inside vessels
+
+    # resize SDF with linear interpolation + anti-aliasing
+    tw, th = int(target[0]), int(target[1])
+    sdf_ds = resize(
+        sdf.astype(np.float32),
+        (th, tw),
+        order=1,
+        preserve_range=True,
+        anti_aliasing=True,
+    ).astype(np.float32)
+
+    # recover binary mask by zero-level threshold
+    out = (sdf_ds > 0.0).astype(np.uint8)
+
+    # optional gentle re-thickening to counteract subpixel erosion
+    if dilation_radius and binary_dilation is not None and disk is not None:
+        out = binary_dilation(out.astype(bool), disk(int(dilation_radius))).astype(np.uint8)
+
+    return out
+
 
 
 def downsample_mask(mask: np.ndarray, src_size: Tuple[int,int], cfg: MaskDownsampleConfig) -> np.ndarray:
@@ -232,7 +273,7 @@ def downsample_mask(mask: np.ndarray, src_size: Tuple[int,int], cfg: MaskDownsam
         mask = mask[...,0]
 
     method = cfg.method.lower()
-    logger.info("downsample_mask method=%s src_size=%s target=%s", method, src_size, cfg.target_size)
+    logger.debug("downsample_mask method=%s src_size=%s target=%s", method, src_size, cfg.target_size)
 
     if method == "nearest":
         return downsample_nearest(mask, cfg.target_size)
@@ -243,7 +284,7 @@ def downsample_mask(mask: np.ndarray, src_size: Tuple[int,int], cfg: MaskDownsam
         try:
             return downsample_majority(mask, cfg.target_size)
         except MaskDownsampleError as e:
-            logger.info("majority failed (%s). Falling back to perclass_area.", str(e))
+            logger.debug("majority failed (%s). Falling back to perclass_area.", str(e))
             return downsample_perclass_area(mask, cfg.target_size)
     if method == "perclass_area":
         return downsample_perclass_area(mask, cfg.target_size)
