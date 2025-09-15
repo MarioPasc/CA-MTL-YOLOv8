@@ -58,6 +58,12 @@ from skimage.util import img_as_ubyte
 from skimage.measure import shannon_entropy
 from skimage.feature.texture import graycomatrix, graycoprops
 from tqdm import tqdm # type: ignore
+from sklearn.preprocessing import StandardScaler  # type: ignore
+try:
+    import umap  # type: ignore
+    UMAP_OK = True
+except Exception:
+    UMAP_OK = False
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -89,6 +95,37 @@ class Config:
     random_state: int = 17
 
 # --------------------------- Utilities ---------------------------------------
+
+def configure_matplotlib() -> None:
+    """
+    Configure matplotlib and scienceplots with LaTeX and requested typography.
+    Falls back gracefully if LaTeX or scienceplots are not available.
+    """
+    try:
+        import scienceplots  # noqa: F401
+        plt.style.use(['science'])  # base science style
+    except Exception as e:
+        logging.warning("scienceplots not available: %s. Continuing with default style.", e)
+
+    # Requested typography
+    plt.rcParams.update({
+        'figure.dpi': 600,
+        'font.size': 10,
+        'font.family': 'serif',
+        'font.serif': ['Times'],
+        'axes.grid': True,
+        'axes.spines.top': False,
+        'axes.spines.right': False,
+        'legend.frameon': False,
+        'savefig.bbox': 'tight',
+    })
+    # LaTeX text rendering
+    try:
+        plt.rcParams['text.usetex'] = True
+        plt.rcParams['text.latex.preamble'] = r'\usepackage{amsmath}'
+    except Exception as e:
+        logging.warning("LaTeX not available: %s. Falling back to non-LaTeX text.", e)
+        plt.rcParams['text.usetex'] = False
 def list_images(d: Path, exts: Tuple[str, ...]) -> List[Path]:
     files = [p for p in d.rglob("*") if p.suffix.lower() in exts]
     files.sort()
@@ -327,6 +364,94 @@ def save_power_spectrum_plot(curves: Dict[str, np.ndarray], title: str, out: Pat
     plt.tight_layout()
     plt.savefig(out); plt.close()
 
+def save_metric_panels(metrics: pd.DataFrame, features: List[str], datasets: List[str], out: Path) -> None:
+    """Create a multi-row panel where each row has ECDF (left) and boxplot (right) for a feature."""
+    features = [f for f in features if f in metrics.columns]
+    if not features:
+        return
+    n_rows = len(features)
+    fig, axes = plt.subplots(n_rows, 2, figsize=(7, 2.2*n_rows), squeeze=False)
+    for i, feat in enumerate(features):
+        # ECDF
+        ax = axes[i, 0]
+        for d in datasets:
+            vals = metrics.loc[metrics.dataset == d, feat].dropna().values
+            if vals.size == 0:
+                continue
+            xs = np.sort(vals)
+            ys = np.linspace(0, 1, len(xs), endpoint=True)
+            ax.plot(xs, ys, label=d)
+        ax.set_xlabel(feat)
+        ax.set_ylabel("ECDF")
+        if i == 0:
+            ax.legend()
+        # Boxplot
+        ax = axes[i, 1]
+        vals = [metrics.loc[metrics.dataset == d, feat].dropna().values for d in datasets]
+        ax.boxplot(vals, tick_labels=datasets, showfliers=False)
+        ax.set_ylabel(feat)
+    fig.tight_layout()
+    fig.savefig(out)
+    plt.close(fig)
+
+def save_qq_panels(metrics: pd.DataFrame, pairs: List[Tuple[str, str]], feats: List[str], out: Path) -> None:
+    """Create a panel of QQ plots for selected features and dataset pairs."""
+    feats = [f for f in feats if f in metrics.columns]
+    if not feats or not pairs:
+        return
+    n_rows = len(feats)
+    n_cols = len(pairs)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(3.2*n_cols, 2.4*n_rows), squeeze=False)
+    for r, feat in enumerate(feats):
+        for c, (A, B) in enumerate(pairs):
+            ax = axes[r, c]
+            a = metrics.loc[metrics.dataset == A, feat].dropna().values
+            b = metrics.loc[metrics.dataset == B, feat].dropna().values
+            if a.size == 0 or b.size == 0:
+                continue
+            percs = np.linspace(1, 99, 99)
+            qa = np.percentile(a, percs)
+            qb = np.percentile(b, percs)
+            ax.scatter(qa, qb, s=6)
+            mn = min(qa.min(), qb.min()); mx = max(qa.max(), qb.max())
+            ax.plot([mn, mx], [mn, mx])
+            ax.set_xlabel(f"{A} {feat}")
+            ax.set_ylabel(f"{B} {feat}")
+            if r == 0:
+                ax.set_title(f"QQ: {A} vs {B}")
+    fig.tight_layout()
+    fig.savefig(out)
+    plt.close(fig)
+
+def save_umap_plot(embeds: pd.DataFrame, out: Path, label_col: str = "dataset") -> None:
+    """2D UMAP of deep embeddings with dataset coloring."""
+    if embeds.empty:
+        logging.info("UMAP skipped: empty embeddings.")
+        return
+    feat_cols = [c for c in embeds.columns if c.startswith("f")]
+    if not feat_cols:
+        logging.info("UMAP skipped: no feature columns found.")
+        return
+    if not UMAP_OK:
+        logging.warning("umap-learn not available. Skipping UMAP plot.")
+        return
+    X = embeds[feat_cols].values
+    y = embeds[label_col].values
+    Xs = StandardScaler().fit_transform(X)
+    reducer = umap.UMAP(n_neighbors=15, min_dist=0.1, n_components=2, random_state=17)
+    Z = reducer.fit_transform(Xs)
+    fig, ax = plt.subplots(figsize=(6, 4))
+    classes = np.unique(y)
+    for cls in classes:
+        mask = (y == cls)
+        ax.scatter(Z[mask, 0], Z[mask, 1], s=6, label=str(cls))
+    ax.set_xlabel("UMAP-1")
+    ax.set_ylabel("UMAP-2")
+    ax.legend(markerscale=2)
+    fig.tight_layout()
+    fig.savefig(out)
+    plt.close(fig)
+
 # ------------------------- Main pipeline -------------------------------------
 def analyze_dataset(name: str, files: List[Path], cfg: Config, enc: Optional[FeatureEncoder]) -> Dict[str, Any]:
     rows = []
@@ -469,6 +594,8 @@ def main():
                  compute_embeddings=(args.compute_embeddings.lower()=="true"),
                  compute_fid=(args.compute_fid.lower()=="true"))
 
+    # Configure plotting style
+    configure_matplotlib()
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
     (cfg.out_dir / "figs").mkdir(exist_ok=True)
 
@@ -541,20 +668,30 @@ def main():
 
     # Visualizations
     dsets = ["angio_det","angio_seg","retina_seg"]
-    for feat in ["mean","std","lap_var","edge_density","ps_slope"]:
-        if feat in scalar_cols:
-            data = {d: metrics.loc[metrics.dataset==d, feat].values for d in dsets}
-            save_ecdf_plot(data, feat, cfg.out_dir / "figs" / f"ecdf_{feat}.png")
-            save_box_plot(data, feat, cfg.out_dir / "figs" / f"box_{feat}.png")
+    # Combined ECDF+Box panels for key features
+    key_feats = [f for f in ["mean","std","lap_var","edge_density","ps_slope"] if f in scalar_cols]
+    if key_feats:
+        save_metric_panels(metrics, key_feats, dsets, cfg.out_dir / "figs" / "panels_metrics.png")
+    # Also keep per-feature single figures for granular inspection
+    for feat in key_feats:
+        data = {d: metrics.loc[metrics.dataset==d, feat].values for d in dsets}
+        save_ecdf_plot(data, feat, cfg.out_dir / "figs" / f"ecdf_{feat}.png")
+        save_box_plot(data, feat, cfg.out_dir / "figs" / f"box_{feat}.png")
 
     # QQ plots for selected pairs
-    if all(f in scalar_cols for f in ("mean","lap_var")):
-        a = metrics.loc[metrics.dataset=="retina_seg","mean"].values
-        b = metrics.loc[metrics.dataset=="angio_seg","mean"].values
-        save_qq_plot(a,b,"retina_seg","angio_seg","QQ mean", cfg.out_dir / "figs" / "qq_mean_retina_vs_angioseg.png")
-        a = metrics.loc[metrics.dataset=="angio_det","lap_var"].values
-        b = metrics.loc[metrics.dataset=="angio_seg","lap_var"].values
-        save_qq_plot(a,b,"angio_det","angio_seg","QQ lap_var", cfg.out_dir / "figs" / "qq_lapvar_det_vs_seg.png")
+    qq_feats = [f for f in ["mean","lap_var"] if f in scalar_cols]
+    qq_pairs: List[Tuple[str, str]] = [("retina_seg","angio_seg"), ("angio_det","angio_seg")]
+    if qq_feats:
+        save_qq_panels(metrics, qq_pairs, qq_feats, cfg.out_dir / "figs" / "qq_panels.png")
+        # Keep the original individual QQs for quick look
+        if "mean" in qq_feats:
+            a = metrics.loc[metrics.dataset=="retina_seg","mean"].values
+            b = metrics.loc[metrics.dataset=="angio_seg","mean"].values
+            save_qq_plot(a,b,"retina_seg","angio_seg","QQ mean", cfg.out_dir / "figs" / "qq_mean_retina_vs_angioseg.png")
+        if "lap_var" in qq_feats:
+            a = metrics.loc[metrics.dataset=="angio_det","lap_var"].values
+            b = metrics.loc[metrics.dataset=="angio_seg","lap_var"].values
+            save_qq_plot(a,b,"angio_det","angio_seg","QQ lap_var", cfg.out_dir / "figs" / "qq_lapvar_det_vs_seg.png")
 
     # Power spectrum curves
     def mean_log_curve(curves: np.ndarray) -> np.ndarray:
@@ -586,6 +723,8 @@ def main():
                 for j, b in enumerate(lab):
                     M[i,j] = float(np.linalg.norm(cent[a]-cent[b]))
             save_heatmap(M, lab, "Centroid distances in embedding space", cfg.out_dir / "figs" / "embedding_centroid_distances.png")
+            # UMAP projection of embeddings
+            save_umap_plot(embeds, cfg.out_dir / "figs" / "umap_embeddings.png")
 
     # Aggregate report
     if not skip_analysis:

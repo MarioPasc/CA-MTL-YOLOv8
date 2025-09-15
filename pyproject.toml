@@ -29,6 +29,7 @@ dependencies = [
   "torch>=1.12.0",
   "torchvision>=0.13.0",
   "scikit-learn>=1.0.0",
+  "scienceplots>=1.0.0",
 
 ]
 
