@@ -481,7 +481,7 @@ def run_preprocessing(output_dir: str, config: Dict, logger, num_workers: int | 
                     med = float(np.median(vals)); mad = float(np.median(np.abs(vals - med)))
                     sigma = 1.4826*mad if mad>0 else 0.0
                     def mz(x: float) -> float: return 0.0 if sigma==0.0 else 0.6745*(x - med)/sigma
-                    ABS_MIN, ABS_MAX = 0.50, 0.86
+                    ABS_MIN, ABS_MAX = 0.5, 0.8
                     COMP_MIN, HOLE_MAX, MZ_MAX = 0.83, 0.005, 2.5
                     kept = quarantined = 0
                     qdir = out_root / 'retinography' / '_qc_excluded'
