@@ -1,5 +1,7 @@
 # Dataset Statistics
 
+Good resource: https://pmc.ncbi.nlm.nih.gov/articles/PMC9011180/ 
+
 ## Purpose
 
 Compare three datasets used in a cross-attention MTL pipeline:
@@ -119,19 +121,19 @@ All figures are created by `dataset_similarity_audit.py`:
 
 
 
-[1]: https://arxiv.org/abs/1802.03426?utm_source=chatgpt.com "UMAP: Uniform Manifold Approximation and Projection for Dimension Reduction"
-[2]: https://wires.onlinelibrary.wiley.com/doi/abs/10.1002/wics.1375?utm_source=chatgpt.com "Energy distance - Rizzo - 2016"
-[3]: https://jmlr.org/papers/volume13/gretton12a/gretton12a.pdf?utm_source=chatgpt.com "A Kernel Two-Sample Test"
-[4]: https://papers.nips.cc/paper/7240-gans-trained-by-a-two-time-scale-update-rule-converge-to-a-local-nash-equilibrium?utm_source=chatgpt.com "GANs Trained by a Two Time-Scale Update Rule ..."
-[5]: https://arxiv.org/abs/1801.01401?utm_source=chatgpt.com "[1801.01401] Demystifying MMD GANs"
-[6]: https://swh.princeton.edu/~wbialek/rome/refs/ruderman%2Bbialek_94.pdf?utm_source=chatgpt.com "Statistics of Natural Images: Scaling in the Woods"
-[7]: https://www.sciencedirect.com/science/article/pii/0042698996000028?utm_source=chatgpt.com "Modelling the Power Spectra of Natural Images: Statistics ..."
-[8]: https://isp-utb.github.io/seminario/papers/Pattern_Recognition_Pertuz_2013.pdf?utm_source=chatgpt.com "Analysis of focus measure operators in shape - GitHub Pages"
-[9]: https://arxiv.org/abs/1604.00546?utm_source=chatgpt.com "Image Quality Assessment for Performance Evaluation of Focus Measure Operators"
-[10]: https://www.cse.ust.hk/~quan/comp5421/notes/canny1986.pdf?utm_source=chatgpt.com "A Computational Approach to Edge Detection"
-[11]: https://openturns.github.io/openturns/latest/theory/data_analysis/empirical_cdf.html?utm_source=chatgpt.com "Empirical cumulative distribution function - OpenTURNS"
-[12]: https://www.itl.nist.gov/div898/handbook/eda/section3/qqplot.htm?utm_source=chatgpt.com "1.3.3.24. Quantile-Quantile Plot"
-[13]: https://pmc.ncbi.nlm.nih.gov/articles/PMC7393676/?utm_source=chatgpt.com "Generalizing Deep Learning for Medical Image ..."
-[14]: https://pmc.ncbi.nlm.nih.gov/articles/PMC9011180/?utm_source=chatgpt.com "Domain Adaptation for Medical Image Analysis: A Survey"
-[15]: https://papers.neurips.cc/paper/8596-transfusion-understanding-transfer-learning-for-medical-imaging.pdf?utm_source=chatgpt.com "Understanding Transfer Learning for Medical Imaging"
-[16]: https://www.nature.com/articles/s41598-022-23990-4?utm_source=chatgpt.com "Physical imaging parameter variation drives domain shift"
+[1]: https://arxiv.org/abs/1802.03426 "UMAP: Uniform Manifold Approximation and Projection for Dimension Reduction"
+[2]: https://wires.onlinelibrary.wiley.com/doi/abs/10.1002/wics.1375 "Energy distance - Rizzo - 2016"
+[3]: https://jmlr.org/papers/volume13/gretton12a/gretton12a.pdf "A Kernel Two-Sample Test"
+[4]: https://papers.nips.cc/paper/7240-gans-trained-by-a-two-time-scale-update-rule-converge-to-a-local-nash-equilibrium "GANs Trained by a Two Time-Scale Update Rule ..."
+[5]: https://arxiv.org/abs/1801.01401 "[1801.01401] Demystifying MMD GANs"
+[6]: https://swh.princeton.edu/~wbialek/rome/refs/ruderman%2Bbialek_94.pdf "Statistics of Natural Images: Scaling in the Woods"
+[7]: https://www.sciencedirect.com/science/article/pii/0042698996000028 "Modelling the Power Spectra of Natural Images: Statistics ..."
+[8]: https://isp-utb.github.io/seminario/papers/Pattern_Recognition_Pertuz_2013.pdf "Analysis of focus measure operators in shape - GitHub Pages"
+[9]: https://arxiv.org/abs/1604.00546 "Image Quality Assessment for Performance Evaluation of Focus Measure Operators"
+[10]: https://www.cse.ust.hk/~quan/comp5421/notes/canny1986.pdf "A Computational Approach to Edge Detection"
+[11]: https://openturns.github.io/openturns/latest/theory/data_analysis/empirical_cdf.html "Empirical cumulative distribution function - OpenTURNS"
+[12]: https://www.itl.nist.gov/div898/handbook/eda/section3/qqplot.htm "1.3.3.24. Quantile-Quantile Plot"
+[13]: https://pmc.ncbi.nlm.nih.gov/articles/PMC7393676/ "Generalizing Deep Learning for Medical Image ..."
+[14]: https://pmc.ncbi.nlm.nih.gov/articles/PMC9011180/ "Domain Adaptation for Medical Image Analysis: A Survey"
+[15]: https://papers.neurips.cc/paper/8596-transfusion-understanding-transfer-learning-for-medical-imaging.pdf "Understanding Transfer Learning for Medical Imaging"
+[16]: https://www.nature.com/articles/s41598-022-23990-4 "Physical imaging parameter variation drives domain shift"

@@ -79,7 +79,7 @@ def main() -> None:
         with open(config_path, "r") as f:
             return yaml.safe_load(f)
 
-    config_path = Path(__file__).parent / "config" / "data.yaml"
+    config_path = Path(__file__).resolve().parents[2] / "config" / "data.yaml"
     config = load_config(str(config_path))
 
     root = config.get("root")

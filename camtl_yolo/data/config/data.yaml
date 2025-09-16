@@ -53,3 +53,17 @@ preprocessing:
     xca: "none" # options: "none", "detect", "segment", "both"
   # Data type
   dtype: uint8
+
+holdout:
+  retinography_segmentation:
+    train: 0.7
+    val: 0.3
+    test: 0.0
+  angiography_segmentation:
+    train: 0.7
+    val: 0.3
+    test: 0.0
+  angiography_detection:
+    train: 0.7
+    val: 0.3
+    test: 0.0
