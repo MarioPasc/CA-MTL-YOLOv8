@@ -138,7 +138,7 @@ def build_retinography_segmentation(root: Path, fractions: HoldoutFractions, see
     out = {}
     for split, paths in split_paths.items():
         out[split] = [
-            {"image": str(p.resolve()), "mask": str(match_mask(p, masks_dir).resolve())}
+            {"image": str(p.resolve()), "mask": str(match_mask(p, masks_dir).resolve()), "is_segmentation": True, "domain": "source"}
             for p in paths
         ]
     return out
@@ -152,7 +152,7 @@ def build_angiography_segmentation(root: Path, fractions: HoldoutFractions, seed
     out = {}
     for split, paths in split_paths.items():
         out[split] = [
-            {"image": str(p.resolve()), "mask": str(match_mask(p, masks_dir).resolve())}
+            {"image": str(p.resolve()), "mask": str(match_mask(p, masks_dir).resolve()), "is_segmentation": True, "domain": "target"}
             for p in paths
         ]
     return out
@@ -166,7 +166,7 @@ def build_angiography_detection(root: Path, fractions: HoldoutFractions, seed: i
     out = {}
     for split, paths in split_paths.items():
         out[split] = [
-            {"image": str(p.resolve()), "label": str(match_label(p, labels_dir).resolve())}
+            {"image": str(p.resolve()), "label": str(match_label(p, labels_dir).resolve()), "is_segmentation": False, "domain": "target"}
             for p in paths
         ]
     return out
