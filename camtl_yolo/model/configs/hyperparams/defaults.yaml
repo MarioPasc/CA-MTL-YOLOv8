@@ -9,9 +9,6 @@ name: CA-MTL-YOLOv8
 
 imgsz: 512 
 
-PRETRAINED_MODELS_PATH: /media/mpascual/PortableSSD/Coronariografías/CAMTL_YOLO/pretrained_models/COCO
-SCALE: s # model scale: n, s, m, l, x
-
 # Hyperparameters ------------------------------------------------------------------------------------------------------
 epochs: 100 
 batch: 4 
