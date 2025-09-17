@@ -10,7 +10,7 @@ from camtl_yolo.external.ultralytics.ultralytics.nn.modules import (
 from camtl_yolo.external.ultralytics.ultralytics.nn.tasks import DetectionModel
 from camtl_yolo.external.ultralytics.ultralytics.utils import LOGGER
 from camtl_yolo.external.ultralytics.ultralytics.utils.loss import v8DetectionLoss
-from camtl_yolo.external.ultralytics.ultralytics.utils.torch_utils import make_divisible
+from camtl_yolo.external.ultralytics.ultralytics.utils.ops import make_divisible
 
 # Cross-Attention Multi-Task Learning modules
 from camtl_yolo.model.nn import CSAM, CTAM, FPMA
@@ -52,11 +52,11 @@ class CAMTL_YOLO(DetectionModel):
             raise FileNotFoundError(f"Detection weights not found at {self.det_weights}")
 
         LOGGER.info(f"Loading backbone and neck from {self.seg_weights}...")
-        ckpt_seg = torch.load(self.seg_weights, map_location=torch.device('cpu'))
+        ckpt_seg = torch.load(self.seg_weights, map_location=torch.device('cpu'), weights_only=False)
         csd_seg = ckpt_seg['model'].float().state_dict()
 
         LOGGER.info(f"Loading detection head from {self.det_weights}...")
-        ckpt_det = torch.load(self.det_weights, map_location=torch.device('cpu'))
+        ckpt_det = torch.load(self.det_weights, map_location=torch.device('cpu'), weights_only=False)
         csd_det = ckpt_det['model'].float().state_dict()
 
         # Create a new state dict for our model
@@ -148,65 +148,140 @@ class CAMTL_YOLO(DetectionModel):
 
         return total_loss, loss_items
 
-    def parse_model(self, d, ch, nc):  # model_dict, input_channels, number_of_classes
+    def parse_model(self, d: dict, ch, nc: int | None = None, verbose: bool = True):
         """
-        Parses a YOLO model from a dict, creating modules and tracking connections.
+        Parse a CAMTL-YOLO model.yaml into a torch.nn.Sequential.
+        Supports sections: backbone, neck, seg_decoder, attn_fusion, seg_head, detect_head (and legacy 'head').
+        Applies scales[SCALE] for depth/width/max_channels.
         """
-        LOGGER.info(f"\n{'':>3}{'from':>18}{'n':>3}{'params':>10}  {'module':<40}{'arguments':<30}")
-        
-        # Get anchors and number of classes from the YAML dict
-        self.yaml = d
-        anchors, nc, gd, gw, act = d.get('anchors'), d.get('nc'), d.get('depth_multiple', 1), d.get('width_multiple', 1), d.get('activation')
+        import ast
+        import contextlib
+        import torch
+        import torch.nn as nn
 
-        # Create a list of layers
-        layers, save, c2 = [], [], ch[-1] if isinstance(ch, list) else ch
-        # Define the structure from the YAML
-        structure = d['backbone'] + d['neck'] + d['seg_decoder'] + d['attn_fusion'] + d['detect_head'] + d['seg_head']
-        for i, (f, n, m, args) in enumerate(structure):
-            m = eval(m) if isinstance(m, str) else m  # eval strings
+        # --- scaling knobs ---
+        act = d.get("activation")
+        scales = d.get("scales")
+        scale = d.get("SCALE", d.get("scale"))
+        depth, width, max_channels = (
+            d.get("depth_multiple", 1.0),
+            d.get("width_multiple", 1.0),
+            float("inf"),
+        )
+        if scales:
+            if not scale:
+                scale = next(iter(scales.keys()))
+                LOGGER.warning(f"no model scale passed. Assuming scale='{scale}'.")
+            try:
+                depth, width, max_channels = scales[scale]
+            except Exception:
+                LOGGER.warning(f"scale '{scale}' not found in 'scales'. Using depth/width defaults.")
+
+        if nc is None:
+            nc = int(d.get("nc", 80))
+
+        if act:
+            Conv.default_act = eval(act)
+
+        if verbose:
+            LOGGER.info(f"\n{'':>3}{'from':>18}{'n':>3}{'params':>10}  {'module':<42}{'arguments':<30}")
+
+        # --- section order (must match YAML indices) ---
+        section_order = ("backbone", "neck", "seg_decoder", "attn_fusion", "seg_head", "detect_head", "head")
+        layers_spec = []
+        for k in section_order:
+            if k in d and isinstance(d[k], list):
+                layers_spec += d[k]
+
+        # --- bookkeeping ---
+        ch = [ch] if isinstance(ch, int) else list(ch)
+        layers, save = [], []
+        c2 = ch[-1]
+        legacy = True  # keep YOLO detect/segment legacy flag behavior
+
+        base_modules = frozenset({
+            Classify, Conv, ConvTranspose, GhostConv, Bottleneck, GhostBottleneck, SPP, SPPF, DWConv, Focus,
+            BottleneckCSP, C1, C2, C2f, C3, C3TR, C3Ghost, nn.ConvTranspose2d, DWConvTranspose2d, C3x, RepC3
+        })
+        repeat_modules = frozenset({BottleneckCSP, C1, C2, C2f, C3, C3TR, C3Ghost, C3x, RepC3})
+
+        # --- build ---
+        for i, (f, n, m, args) in enumerate(layers_spec):
+            # resolve module symbol -> class
+            if isinstance(m, str):
+                if m.startswith("nn."):
+                    m = getattr(nn, m[3:])
+                elif m.startswith("torchvision.ops."):
+                    m = getattr(__import__("torchvision").ops, m[16:])
+                elif hasattr(nn, m):  # allow bare names like "Identity"
+                    m = getattr(nn, m)
+                else:
+                    m = globals()[m]
+
+            # safe literal-eval of string args (e.g., 'heads=4')
             for j, a in enumerate(args):
-                try:
-                    args[j] = eval(a) if isinstance(a, str) else a  # eval strings
-                except (NameError, SyntaxError):
-                    pass
+                if isinstance(a, str):
+                    with contextlib.suppress(ValueError, SyntaxError):
+                        args[j] = locals()[a] if a in locals() else ast.literal_eval(a)
 
-            n = n_ = max(round(n * gd), 1) if n > 1 else n  # depth gain
-            if m in (Classify, Conv, ConvTranspose, GhostConv, Bottleneck, GhostBottleneck, SPP, SPPF, DWConv, Focus,
-                    BottleneckCSP, C1, C2, C2f, C3, C3TR, C3Ghost, nn.ConvTranspose2d, DWConvTranspose2d, C3x, RepC3):
+            # depth scaling
+            n_ = n
+            n = max(round(n * depth), 1) if n > 1 else n
+
+            # channel flow
+            if m in base_modules:
                 c1, c2 = ch[f], args[0]
-                if c2 != nc:  # if not output
-                    c2 = make_divisible(c2 * gw, 8)
-
+                if c2 != nc:  # not a classifier output
+                    c2 = make_divisible(min(c2, max_channels) * width, 8)
                 args = [c1, c2, *args[1:]]
-                if m in [BottleneckCSP, C1, C2, C2f, C3, C3TR, C3Ghost, C3x, RepC3]:
-                    args.insert(2, n)  # number of repeats
+                if m in repeat_modules:
+                    args.insert(2, n)
                     n = 1
-            elif m is nn.BatchNorm2d:
-                args = [ch[f]]
             elif m is Concat:
-                c2 = sum(ch[x] for x in f)
-            elif m in (Detect, Segment):
-                args.append([ch[x] for x in f])
-                if isinstance(args[1], int):  # number of anchors
-                    args[1] = [list(range(args[1] * 2))] * len(f)
-                if m is Segment:
-                    args[3] = make_divisible(args[3] * gw, 8)
+                f_list = f if isinstance(f, list) else [f]
+                c2 = sum(ch[x] for x in f_list)
+            elif m is Detect:
+                # args: [nc, ...] -> append list of in-channels
+                args.append([ch[x] for x in (f if isinstance(f, list) else [f])])
+                m.legacy = legacy
+            elif m is Segment:
+                args.append([ch[x] for x in (f if isinstance(f, list) else [f])])
+                # prototype channels at args[2]
+                if len(args) >= 3 and isinstance(args[2], (int, float)):
+                    args[2] = make_divisible(min(args[2], max_channels) * width, 8)
+                m.legacy = legacy
+            elif m is nn.Identity:
+                # passthrough, no args, output ch equals input ch
+                c2 = ch[f] if isinstance(f, int) else ch[f[-1]]
             elif m in {CTAM, CSAM, FPMA}:
-                # Custom module handling: c_in can be a list of channels
+                # custom blocks take input channel list first
                 c_in = [ch[x] for x in f] if isinstance(f, list) else ch[f]
-                args.insert(0, c_in)
-                c2 = args[1] if len(args) > 1 else c_in # Output channels
+                args = [c_in, *args]
+                # infer output channels: second arg if int, else pass-through last in
+                LOGGER.debug(f"Custom block {m.__name__} with input channels {c_in} and args {args}")
+                LOGGER.debug(f"Arguments for {m.__name__}: {args}")
+                c2 = args[1] if len(args) > 1 and isinstance(args[1], int) else (c_in[-1] if isinstance(c_in, list) else c_in)
             else:
-                c2 = ch[f]
+                # default: keep last input channel size
+                c2 = ch[f] if isinstance(f, int) else ch[f[-1]]
 
-            m_ = nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # module
-            t = str(m)[8:-2].replace('__main__.', '')  # module type
-            np = sum(x.numel() for x in m_.parameters())  # number params
-            m_.i, m_.f, m_.type, m_.np = i, f, t, np  # attach index, 'from' index, type, number params
-            LOGGER.info(f'{i:>3}{str(f):>18}{n_:>3}{np:10.0f}  {t:<40}{str(args):<30}')  # print
-            save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)  # append to savelist
+            # instantiate
+            m_ = nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)
+            t = str(m)[8:-2].replace("__main__.", "")
+            m_.np = sum(x.numel() for x in m_.parameters())
+            m_.i, m_.f, m_.type = i, f, t
+
+            if verbose:
+                LOGGER.info(f"{i:>3}{str(f):>18}{n_:>3}{m_.np:10.0f}  {t:<42}{str(args):<30}")
+
+            # record savelist
+            f_list = [f] if isinstance(f, int) else list(f)
+            save.extend(x % i for x in f_list if x != -1)
+
             layers.append(m_)
             if i == 0:
                 ch = []
             ch.append(c2)
-        return nn.Sequential(*layers), sorted(list(set(save)))
+
+        return nn.Sequential(*layers), sorted(set(save))
+

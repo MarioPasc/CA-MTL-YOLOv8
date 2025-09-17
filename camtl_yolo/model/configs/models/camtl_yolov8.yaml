@@ -1,26 +1,25 @@
-nc: 1 # number of classes; we only detect stenosis
-scales: # model compound scaling constants, i.e. 'model=yolov8n.yaml' will call yolov8.yaml with scale 'n'
-  # [depth, width, max_channels]
+nc: 1
+scales:
   n: [0.33, 0.25, 1024]
   s: [0.33, 0.50, 1024]
   m: [0.67, 0.75, 768]
   l: [1.00, 1.00, 512]
   x: [1.00, 1.25, 512]
 
-# ===== Backbone (unchanged YOLOv8, GN applied in code) =====
+# ===== Backbone (YOLOv8) =====
 backbone:
-  - [-1, 1, Conv, [64, 3, 2]]           # 0  -> P1/2
-  - [-1, 1, Conv, [128, 3, 2]]          # 1  -> P2/4
-  - [-1, 3, C2f, [128, True]]           # 2
-  - [-1, 1, Conv, [256, 3, 2]]          # 3  -> P3/8
-  - [-1, 6, C2f, [256, True]]           # 4  (P3 feat)
-  - [-1, 1, Conv, [512, 3, 2]]          # 5  -> P4/16
-  - [-1, 6, C2f, [512, True]]           # 6  (P4 feat)
-  - [-1, 1, Conv, [1024, 3, 2]]         # 7  -> P5/32
-  - [-1, 3, C2f, [1024, True]]          # 8
-  - [-1, 1, SPPF, [1024, 5]]            # 9  (P5 feat)
+  - [-1, 1, Conv, [64, 3, 2]]            # 0  P1/2
+  - [-1, 1, Conv, [128, 3, 2]]           # 1  P2/4
+  - [-1, 3, C2f, [128, True]]            # 2
+  - [-1, 1, Conv, [256, 3, 2]]           # 3  P3/8
+  - [-1, 6, C2f, [256, True]]            # 4  (P3 feat)
+  - [-1, 1, Conv, [512, 3, 2]]           # 5  P4/16
+  - [-1, 6, C2f, [512, True]]            # 6  (P4 feat)
+  - [-1, 1, Conv, [1024, 3, 2]]          # 7  P5/32
+  - [-1, 3, C2f, [1024, True]]           # 8
+  - [-1, 1, SPPF, [1024, 5]]             # 9  (P5 feat)
 
-# ===== PAN neck to produce *base* multi-scale features (before CTAM) =====
+# ===== PAN neck (base multi-scale features) =====
 neck:
   # up path
   - [9, 1, nn.Upsample, [None, 2, 'nearest']]     # 10  P5->P4
@@ -34,35 +33,32 @@ neck:
   - [[16, 12], 1, Concat, [1]]                    # 17
   - [-1, 3, C2f, [512, False]]                    # 18  N_P4 (refined)
   - [18, 1, Conv, [512, 3, 2]]                    # 19  P4->P5
-  - [[19, 9], 1, Concat, [1]]                      # 20
+  - [[19, 9], 1, Concat, [1]]                     # 20
   - [-1, 3, C2f, [1024, False]]                   # 21  N_P5
-  # N_P3=15, N_P4=18, N_P5=21
+  # Channel summary: N_P3=256 (15), N_P4=512 (18), N_P5=1024 (21)
 
-# ===== Segmentation decoder with FPMA (coarse->fine), produce seg feats/logits =====
+# ===== Segmentation decoder with FPMA (coarse→fine) =====
 seg_decoder:
-  - [21, 1, Conv, [256, 1, 1]]                    # 22  S5_feat (reduced P5)
-  - [22, 1, Conv, [1, 1, 1]]        # 23  SegLogits_P5 (aux)
+  - [21, 1, Conv, [256, 1, 1]]                    # 22  S5_feat: reduce P5 1024→256
+  - [22, 1, nn.Upsample, [None, 2, 'nearest']]    # 23  S5↑: to P4 size
+  - [[18, 23], 1, FPMA, [4, 256]]       # 24  S4_feat = FPMA(coarse=256, fine=512, heads=4, embed=256)
+  - [24, 1, Conv, [1, 1, 1]]                      # 25  SegLogits_P4 (aux)
+  - [24, 1, nn.Upsample, [None, 2, 'nearest']]    # 26  S4↑: to P3 size
+  - [[15, 26], 1, FPMA, [4, 256]]       # 27  S3_feat = FPMA(coarse=512, fine=256, heads=4, embed=256)
+  - [27, 1, Conv, [1, 1, 1]]                      # 28  SegLogits_P3 (FINAL)
 
-  - [[18, 22], 1, FPMA, [heads=4, embed=256]]     # 24  S4_feat = FPMA(fine=N_P4, coarse=S5_feat)
-  - [24, 1, Conv, [1, 1, 1]]        # 25  SegLogits_P4 (aux)
-
-  - [[15, 24], 1, FPMA, [heads=4, embed=256]]     # 26  S3_feat = FPMA(fine=N_P3, coarse=S4_feat)
-  # Cross-Scale Self-Attention inside seg stream; return refined fine (P3)
-  - [[26, 24, 22], 1, CSAM, [embed=256, heads=4, return='fine']]   # 27  S3_ref
-  - [27, 1, Conv, [1, 1, 1]]                        # 28  SegLogits_P3 (FINAL, binary)
-
-
-# ===== Mask-guided CTAM: use seg features to refine detection features at each scale =====
+# ===== Mask-guided CTAM (task fusion per scale) =====
 attn_fusion:
-  - [[21, 22], 1, CTAM, [heads=4, embed=256]]     # 28  D5_ref = CTAM(det=N_P5, seg=S5_feat)
-  - [[18, 24], 1, CTAM, [heads=4, embed=256]]     # 29  D4_ref = CTAM(det=N_P4, seg=S4_feat)
-  - [[15, 26], 1, CTAM, [heads=4, embed=256]]     # 30  D3_ref = CTAM(det=N_P3, seg=S3_feat)
+  - [[21, 22], 1, CTAM, [4, 256]]      # 29  D5_ref = CTAM(tgt=1024, src=256, heads=4, embed=256)
+  - [[18, 24], 1, CTAM, [4, 256]]       # 30  D4_ref = CTAM(tgt=512,  src=512, heads=4, embed=256)
+  - [[15, 27], 1, CTAM, [4, 256]]       # 31  D3_ref = CTAM(tgt=256,  src=256, heads=4, embed=256)
 
-  - [[31, 30, 29], 1, CSAM, [embed=256, heads=4]] # 31  CSAM on det [P3,P4,P5] → [D3cs,D4cs,D5cs]
+  # Cross-scale refinement on detection path
+  - [[31, 30, 29], 1, CSAM, [256, 4]]   # 32  [D3cs, D4cs, D5cs]
 
-# ===== Heads: emit BOTH predictions =====
-detect_head:
-  - [32, 1, Detect, [nc]]                          # 32  final detection head (takes list from CSAM)
+# ===== Heads =====
+det_head:
+  - [32, 1, Detect, [nc]]                          # 33  Detect takes list [D3cs,D4cs,D5cs]
 
 seg_head:
-  - [28, 1, Identity, []]                         # expose SegLogits_P3 as final seg output
+  - [28, 1, nn.Identity, []]                      # 34  expose final seg logits (P3)
