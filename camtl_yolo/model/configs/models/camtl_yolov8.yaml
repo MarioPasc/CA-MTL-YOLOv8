@@ -57,8 +57,8 @@ attn_fusion:
   - [[31, 30, 29], 1, CSAM, [256, 4]]   # 32  [D3cs, D4cs, D5cs]
 
 # ===== Heads =====
-det_head:
-  - [32, 1, Detect, [nc]]                          # 33  Detect takes list [D3cs,D4cs,D5cs]
-
 seg_head:
   - [28, 1, nn.Identity, []]                      # 34  expose final seg logits (P3)
+
+det_head:
+  - [32, 1, Detect, [nc]]                          # 33  Detect takes list [D3cs,D4cs,D5cs]

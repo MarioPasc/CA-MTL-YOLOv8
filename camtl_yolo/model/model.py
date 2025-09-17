@@ -68,7 +68,7 @@ class CAMTL_YOLO(DetectionModel):
                 # In yolov8s-seg.pt, the segmentation head is layer 22. We don't want to load it.
                 if 'model.22.' not in k:
                     new_state_dict[k] = v
-                    LOGGER.info(f"Loaded {k} from segmentation model.")
+                    LOGGER.debug(f"Loaded {k} from segmentation model.")
 
         # Load detection head weights from detection model
         # In yolov8s.pt, the detection head is layer 22. In our custom model, it's layer 33.
@@ -80,7 +80,7 @@ class CAMTL_YOLO(DetectionModel):
                 new_k = k_det.replace('model.22.', 'model.33.')
                 if new_k in new_state_dict and new_state_dict[new_k].shape == v_det.shape:
                     new_state_dict[new_k] = v_det
-                    LOGGER.info(f"Loaded {k_det} as {new_k} from detection model.")
+                    LOGGER.debug(f"Loaded {k_det} as {new_k} from detection model.")
                 else:
                     LOGGER.warning(f"Could not load {k_det} as {new_k}. Shape mismatch or key not found.")
 
