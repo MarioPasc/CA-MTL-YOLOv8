@@ -15,6 +15,12 @@ from camtl_yolo.external.ultralytics.ultralytics.utils.ops import make_divisible
 # Cross-Attention Multi-Task Learning modules
 from camtl_yolo.model.nn import CSAM, CTAM, FPMA, SegHead
 
+def _find_idx(modules, cls):
+    for i, m in enumerate(modules):
+        if isinstance(m, cls):
+            return i
+    return None
+
 class CAMTL_YOLO(DetectionModel):
     """
     CA-MTL-YOLOv8 model for combined object detection and segmentation.
@@ -46,70 +52,27 @@ class CAMTL_YOLO(DetectionModel):
         # Load pretrained weights
         self._load_pretrained_weights()
 
-    def _load_pretrained_weights(self):
-        """Loads pretrained weights from detection and segmentation checkpoints."""
-        if not self.seg_weights.exists():
-            raise FileNotFoundError(f"Segmentation weights not found at {self.seg_weights}")
-        if not self.det_weights.exists():
-            raise FileNotFoundError(f"Detection weights not found at {self.det_weights}")
-
-        LOGGER.info(f"Loading backbone and neck from {self.seg_weights}...")
-        ckpt_seg = torch.load(self.seg_weights, map_location=torch.device('cpu'), weights_only=False)
-        csd_seg = ckpt_seg['model'].float().state_dict()
-
-        LOGGER.info(f"Loading detection head from {self.det_weights}...")
-        ckpt_det = torch.load(self.det_weights, map_location=torch.device('cpu'), weights_only=False)
-        csd_det = ckpt_det['model'].float().state_dict()
-
-        # Create a new state dict for our model
-        new_state_dict = self.state_dict()
-        
-        # Load backbone and neck weights from segmentation model
-        for k, v in csd_seg.items():
-            if k in new_state_dict and new_state_dict[k].shape == v.shape:
-                # In yolov8s-seg.pt, the segmentation head is layer 22. We don't want to load it.
-                if 'model.22.' not in k:
-                    new_state_dict[k] = v
-                    LOGGER.debug(f"Loaded {k} from segmentation model.")
-
-        # Load detection head weights from detection model
-        # In yolov8s.pt, the detection head is layer 22. In our custom model, it's layer 33.
-        # This mapping needs to be adjusted based on the final YAML structure.
-        # Assuming detect_head is at index 33
-        for k_det, v_det in csd_det.items():
-            if 'model.22.' in k_det:
-                # Map layer 22 from detection checkpoint to layer 33 in our model
-                new_k = k_det.replace('model.22.', 'model.33.')
-                if new_k in new_state_dict and new_state_dict[new_k].shape == v_det.shape:
-                    new_state_dict[new_k] = v_det
-                    LOGGER.debug(f"Loaded {k_det} as {new_k} from detection model.")
-                else:
-                    LOGGER.warning(f"Could not load {k_det} as {new_k}. Shape mismatch or key not found.")
-
-        # Load the combined state dict
-        self.load_state_dict(new_state_dict, strict=False)
-        LOGGER.info("Pretrained weights loaded successfully. Unmatched weights will be initialized randomly.")
-
     def _forward_once(self, x):
         """
-        Executes the forward pass, returning raw outputs from detection and segmentation heads.
+        Forward pass. Returns (det_out, seg_out) from the actual head modules,
+        not from cached y indices.
         """
-        y, dt = [], []  # outputs
+        y = []
+        det_out, seg_out = None, None
+
         for m in self.model:
-            if m.f != -1:  # if not from previous layer
-                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
-            x = m(x)  # run
-            y.append(x if m.i in self.save else None)  # save output
-        
-        # Assuming detect_head is at index 33 and seg_head is at 34 from the YAML
-        # These indices must match your ca_mtl_yolov8.yaml
-        detect_head_idx = -2 # Typically the second to last module
-        seg_head_idx = -1 # Typically the last module
-        
-        det_out = y[self.model[detect_head_idx].i]
-        seg_out = y[self.model[seg_head_idx].i]
-        
-        return (det_out, seg_out)
+            if m.f != -1:
+                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]
+            x = m(x)
+            # capture head outputs directly and keep normal caching
+            if isinstance(m, Detect):
+                det_out = x
+            elif isinstance(m, SegHead):
+                seg_out = x
+            y.append(x if m.i in self.save else None)
+
+        return det_out, seg_out
+
 
     def init_criterion(self):
         """Initializes the loss functions for multi-task training."""
@@ -149,6 +112,77 @@ class CAMTL_YOLO(DetectionModel):
         loss_items = {'loss': total_loss}
 
         return total_loss, loss_items
+
+# --- in model.py: replace _load_pretrained_weights entirely ---
+    def _load_pretrained_weights(self):
+        """Load COCO weights: backbone+neck from *seg* ckpt, Detect head from *det* ckpt.
+        Skip classification branches when nc!=COCO_nc to avoid shape errors.
+        """
+        if not self.seg_weights.exists():
+            raise FileNotFoundError(f"Segmentation weights not found at {self.seg_weights}")
+        if not self.det_weights.exists():
+            raise FileNotFoundError(f"Detection weights not found at {self.det_weights}")
+
+        LOGGER.info(f"Loading backbone and neck from {self.seg_weights}...")
+        ckpt_seg = torch.load(self.seg_weights, map_location="cpu", weights_only=False)
+        csd_seg = ckpt_seg["model"].float().state_dict()
+
+        LOGGER.info(f"Loading detection head from {self.det_weights}...")
+        ckpt_det = torch.load(self.det_weights, map_location="cpu", weights_only=False)
+        csd_det = ckpt_det["model"].float().state_dict()
+
+        new_sd = self.state_dict()
+        det_idx = _find_idx(self.model, Detect)
+
+        loaded, skipped, mismatched = 0, 0, 0
+        det_loaded, det_total_eligible = 0, 0
+
+        # 1) load backbone+neck from yolov8*-seg.pt, exclude its seg head block ('model.22.')
+        for k, v in csd_seg.items():
+            if k.startswith("model.22."):  # seg head in Ultralytics seg ckpt
+                skipped += 1
+                continue
+            if k in new_sd and new_sd[k].shape == v.shape:
+                new_sd[k] = v
+                loaded += 1
+            else:
+                mismatched += 1
+
+        # 2) load detect head from yolov8*.pt into our Detect idx, but ignore cls branch if nc differs
+        if det_idx is None:
+            LOGGER.warning("Detect head not found; skipping detect-head remap")
+        else:
+            # determine if classification tensors are shape-compatible
+            # In Ultralytics Detect, 'cv3' corresponds to classification convs and depends on nc.
+            model_nc = getattr(self.model[det_idx], "nc", None)
+            coco_nc = ckpt_det["model"].nc if hasattr(ckpt_det["model"], "nc") else 80
+            skip_cls = (model_nc is not None) and (int(model_nc) != int(coco_nc))
+
+            for k_det, v_det in csd_det.items():
+                if not k_det.startswith("model.22."):
+                    continue
+                sub = k_det.split("model.22.", 1)[1]
+                if skip_cls and sub.startswith("cv3"):
+                    # classification tensors depend on nc -> skip when nc!=COCO
+                    skipped += 1
+                    continue
+
+                new_k = f"model.{det_idx}.{sub}"
+                det_total_eligible += 1
+                if new_k in new_sd and new_sd[new_k].shape == v_det.shape:
+                    new_sd[new_k] = v_det
+                    loaded += 1
+                    det_loaded += 1
+                else:
+                    mismatched += 1
+                    LOGGER.warning(f"Could not map {k_det} -> {new_k} (missing or shape mismatch)")
+
+        # commit
+        self.load_state_dict(new_sd, strict=False)
+        LOGGER.info(
+            f"Pretrained load summary: loaded={loaded}, skipped={skipped}, "
+            f"shape_mismatch={mismatched}, det_mapped={det_loaded}/{det_total_eligible}"
+        )
 
     def parse_model(self, d: dict, ch, nc: int | None = None, verbose: bool = True):
         """
