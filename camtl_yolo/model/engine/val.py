@@ -7,11 +7,11 @@ from typing import Any, Dict
 import torch
 import torch.nn.functional as F
 
-from camtl_yolo.train.normalization import set_bn_domain
-from camtl_yolo.train.samplers import map_domain_name
-from ultralytics.engine.validator import BaseValidator
-from ultralytics.utils import LOGGER
-from ultralytics.utils.torch_utils import smart_inference_mode, unwrap_model
+from camtl_yolo.model.utils.normalization import set_bn_domain
+from camtl_yolo.model.utils.samplers import map_domain_name
+from camtl_yolo.external.ultralytics.ultralytics.engine.validator import BaseValidator
+from camtl_yolo.external.ultralytics.ultralytics.utils import LOGGER
+from camtl_yolo.external.ultralytics.ultralytics.utils.torch_utils import smart_inference_mode, unwrap_model
 
 
 class CAMTLValidator(BaseValidator):

@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from pathlib import Path
-import yaml
+import yaml # type: ignore
 
 # Ultralytics modules
 from camtl_yolo.external.ultralytics.ultralytics.nn.modules import (
@@ -10,6 +10,7 @@ from camtl_yolo.external.ultralytics.ultralytics.nn.modules import (
 from camtl_yolo.external.ultralytics.ultralytics.nn.tasks import DetectionModel
 from camtl_yolo.external.ultralytics.ultralytics.utils import LOGGER
 from camtl_yolo.external.ultralytics.ultralytics.utils.ops import make_divisible
+from camtl_yolo.external.ultralytics.ultralytics.utils import LOGGER
 
 # Cross-Attention Multi-Task Learning modules
 from camtl_yolo.model.nn import CSAM, CTAM, FPMA, SegHead
@@ -28,15 +29,31 @@ class CAMTL_YOLO(DetectionModel):
     """
 
     def __init__(self, cfg='camtl_yolov8.yaml', ch=3, nc=None, verbose=True):
-        super().__init__()
-        # Load YAML
+        """
+        Custom init that avoids Ultralytics DetectionModel.__init__ stride-probing,
+        which assumes forward() returns a single Detect output. We:
+        1) nn.Module init
+        2) load YAML and build via parse_model
+        3) compute stride from det outputs using _forward_once()
+        4) init weights
+        5) task-aware weight loading (COCO or fine-tuned)
+        """
+        import torch
+        import torch.nn as nn
+        from pathlib import Path
+        import yaml as _yaml  # type: ignore
+        from camtl_yolo.external.ultralytics.ultralytics.utils.torch_utils import initialize_weights
+
+        nn.Module.__init__(self)  # avoid DetectionModel.__init__()
+
+        # --- Load YAML ---
         if isinstance(cfg, dict):
             self.yaml = cfg
             self.yaml_file = Path(__file__).resolve().parents[2] / "configs/models/camtl_yolov8.yaml"
         else:
-            self.yaml_file = Path(cfg).name
+            self.yaml_file = Path(cfg)
             with open(cfg, 'r', encoding='utf-8') as f:
-                self.yaml = yaml.safe_load(f)
+                self.yaml = _yaml.safe_load(f)
 
         # Common knobs
         self.task = str(self.yaml.get("TASK", "DomainShift1"))
@@ -47,11 +64,70 @@ class CAMTL_YOLO(DetectionModel):
         self.seg_weights = self.pretrained_root / f"yolov8{self.scale}-seg.pt"
         self.det_weights = self.pretrained_root / f"yolov8{self.scale}.pt"
 
-        # Build architecture
-        self.model, self.save = self.parse_model(self.yaml, ch=[ch] if isinstance(ch, int) else ch, nc=nc, verbose=verbose)
+        # --- Build architecture ---
+        # Note: pass nc override if provided
+        self.model, self.save = self.parse_model(self.yaml, ch=[ch] if isinstance(ch, int) else ch,
+                                                nc=(int(nc) if nc is not None else None),
+                                                verbose=verbose)
+        self.inplace = bool(self.yaml.get("inplace", True))
+        # names dict like Ultralytics
+        self.names = {i: f"{i}" for i in range(int(self.yaml.get("nc", nc if nc is not None else 80)))}
+        self.end2end = getattr(self.model[-1], "end2end", False)
 
-        # Task-aware weight loading
+        # --- Compute stride using our forward_once → detect feature maps ---
+        det_idx = _find_idx(self.model, Detect)
+        if det_idx is not None:
+            s = 256  # probe size
+            x_dummy = torch.zeros(1, ch if isinstance(ch, int) else int(ch[0]), s, s)
+            self.model.eval()
+            m_det = self.model[det_idx]
+            if hasattr(m_det, "inplace"):
+                m_det.inplace = self.inplace
+
+            det_out, _ = self._forward_once(x_dummy)  # may be list/tuple and can be nested
+
+            # Normalize to a flat list of feature maps [P3, P4, P5]
+            fms = None
+            if isinstance(det_out, (list, tuple)):
+                # Case A: nested like (preds, [P3,P4,P5]) or ([P3,P4,P5], preds)
+                for elem in det_out:
+                    if isinstance(elem, (list, tuple)) and all(torch.is_tensor(t) for t in elem):
+                        fms = list(elem)
+                        break
+                # Case B: flat list/tuple of tensors already
+                if fms is None and all(torch.is_tensor(t) for t in det_out):
+                    fms = list(det_out)
+            elif torch.is_tensor(det_out):
+                # Rare case: single fm
+                fms = [det_out]
+
+            if not fms or not all(torch.is_tensor(t) and t.ndim >= 3 for t in fms):
+                raise RuntimeError(f"Could not extract Detect feature maps for stride probing. Got type={type(det_out)}")
+
+            m_det.stride = torch.tensor([s / fm.shape[-2] for fm in fms], dtype=torch.float32)
+            self.stride = m_det.stride
+            self.model.train()
+            if hasattr(m_det, "bias_init"):
+                m_det.bias_init()
+        else:
+            self.stride = torch.tensor([32.0], dtype=torch.float32)
+
+        # --- Init weights like Ultralytics ---
+        initialize_weights(self)
+        if verbose:
+            self.info = lambda detailed=False, verbose=True, imgsz=640: None  # optional no-op info
+            LOGGER.info(f"YOLOv8{self.scale} summary: {sum(p.numel() for p in self.parameters())} parameters")
+
+        # --- Task-aware weight loading (COCO or fine-tuned) ---
         self._load_task_weights()
+
+    def forward(self, x, *args, **kwargs):
+        """
+        Return a 2-tuple (det_preds, seg_preds).
+        det_preds is the Detect head raw outputs (list of 3 tensors).
+        seg_preds is a tensor or a list of tensors, depending on SegHead.
+        """
+        return self._forward_once(x)
 
     def _forward_once(self, x):
         """
@@ -74,36 +150,54 @@ class CAMTL_YOLO(DetectionModel):
 
         return det_out, seg_out
 
-
     def init_criterion(self):
         """
         Initialize multi-task criteria.
         Reads optional weights from self.yaml['LOSS'].
+        Also ensures Ultralytics v8DetectionLoss finds hyperparams under self.args.
         """
+        from types import SimpleNamespace
+
         cfg = self.yaml.get("LOSS", {}) if isinstance(self.yaml, dict) else {}
-        # Detection loss from Ultralytics (uses model internals)
-        self.detect_criterion = DetectionLoss(self, hyp=cfg.get("det_hyp"))
+        det_hyp = cfg.get("det_hyp") or {}
+        # Defaults match Ultralytics-style gains needed by v8DetectionLoss
+        det_defaults = {"box": 7.5, "cls": 0.5, "dfl": 1.5}
+        # Create/patch self.args so external v8DetectionLoss can read model.args
+        if not hasattr(self, "args") or self.args is None:
+            self.args = SimpleNamespace(**{**det_defaults, **det_hyp})
+        else:
+            # add missing fields without overwriting existing
+            for k, v in {**det_defaults, **det_hyp}.items():
+                if not hasattr(self.args, k):
+                    setattr(self.args, k, v)
+
+        # Detection loss from Ultralytics (uses model.args)
+        self.detect_criterion = DetectionLoss(self, hyp=det_hyp)
+
         # Segmentation loss: BCE+Dice at one or more scales
-        seg_scales = cfg.get("seg_scale_weights")  # e.g., [0.25, 0.35, 0.40]
+        seg_scales = cfg.get("seg_scale_weights")
         self.segment_criterion = MultiScaleBCEDiceLoss(
             bce_weight=float(cfg.get("seg_bce", 1.0)),
             dice_weight=float(cfg.get("seg_dice", 1.0)),
             scale_weights=seg_scales,
             from_logits=bool(cfg.get("seg_from_logits", True)),
         )
+
         # Consistency: boxes → pseudo-mask on detection-domain images
         self.consistency_criterion = ConsistencyMaskFromBoxes(
             weight=float(cfg.get("consistency", 0.1)),
             loss=str(cfg.get("consistency_loss", "bce")).lower(),
         )
-        # Attention alignment between domains using CTAM attention snapshots
+
+        # Attention alignment
         self.align_criterion = AttentionAlignmentLoss(
             model=self,
             source_name=str(cfg.get("source_domain", "retinography")),
             target_name=str(cfg.get("target_domain", "angiography")),
             weight=float(cfg.get("align", 0.1)),
         )
-        # scalar weights for combining
+
+        # Scalar weights
         self._lambda_det = float(cfg.get("lambda_det", 1.0))
         self._lambda_seg = float(cfg.get("lambda_seg", 1.0))
         self._lambda_cons = float(cfg.get("lambda_cons", 0.1))
@@ -119,15 +213,35 @@ class CAMTL_YOLO(DetectionModel):
         - Attention alignment loss across domains if CTAM attention is available.
         - Optional L2-SP regularization if tasks.configure_task attached self._l2sp.
         """
-        det_preds, seg_preds = preds
+        def _shape_str(obj):
+            if obj is None:
+                return "None"
+            if torch.is_tensor(obj):
+                return str(tuple(obj.shape))
+            if isinstance(obj, (list, tuple)):
+                return "[" + ", ".join(_shape_str(t) for t in obj) + "]"
+            return type(obj).__name__
+
+        # safe, nested shape logging
+        LOGGER.info(f"Preds shapes: {_shape_str(preds)}")
+
+        # Unpack robustly: expect a 2-tuple; if not, assume det-only and set seg=None
+        if isinstance(preds, (list, tuple)) and len(preds) == 2:
+            det_preds, seg_preds = preds
+        else:
+            det_preds, seg_preds = preds, None
+
         device = batch["img"].device
 
         # detection
         has_det = batch["bboxes"].numel() > 0
+
         loss_det = torch.zeros((), device=device)
         det_items = {}
         if has_det:
             loss_det, det_items = self.detect_criterion(det_preds, batch)
+            if isinstance(loss_det, torch.Tensor) and loss_det.ndim > 0:
+                loss_det = loss_det.sum()
 
         # segmentation (only if any seg sample exists in batch)
         has_seg = bool(batch["is_seg"].any().item()) if isinstance(batch["is_seg"], torch.Tensor) else any(batch["is_seg"])
@@ -147,6 +261,15 @@ class CAMTL_YOLO(DetectionModel):
         if hasattr(self, "_l2sp") and self._l2sp is not None:
             l2sp_term = self._l2sp(self)
 
+        def _to_scalar(t: torch.Tensor) -> torch.Tensor:
+            # Sum if vector per level, keep dtype/device
+            return t if t.ndim == 0 else t.sum()
+
+        loss_det   = _to_scalar(loss_det)
+        loss_seg   = _to_scalar(loss_seg)
+        cons_loss  = _to_scalar(cons_loss)
+        align_loss = _to_scalar(align_loss)
+
         total = (
             self._lambda_det * loss_det
             + self._lambda_seg * loss_seg
@@ -162,6 +285,10 @@ class CAMTL_YOLO(DetectionModel):
         items.update(align_items)
         items["l2sp"] = l2sp_term.detach()
         items["loss"] = total.detach()
+        items.setdefault("det_loss", loss_det.detach())
+        items.setdefault("seg_loss",    loss_seg.detach())
+        items.setdefault("cons_loss",   cons_loss.detach())
+        items.setdefault("align_loss",  align_loss.detach())
         return total, items
     
     def _load_pretrained_weights(self):
