@@ -27,7 +27,7 @@ class CAMTL_YOLO(DetectionModel):
     This class should be used with a custom 'ca_mtl' task trainer.
     """
 
-    def __init__(self, cfg='ca_mtl_yolov8.yaml', ch=3, nc=None, verbose=True):
+    def __init__(self, cfg='camtl_yolov8.yaml', ch=3, nc=None, verbose=True):
         """Initializes the model, parses the YAML config, and builds the network."""
         super().__init__()  
         if isinstance(cfg, dict):

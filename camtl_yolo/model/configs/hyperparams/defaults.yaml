@@ -1,6 +1,6 @@
 # 
-task: detect # (str) YOLO task, i.e. detect, segment, classify, pose, obb
-mode: train # (str) YOLO mode, i.e. train, val, predict, export, track, benchmark
+task: DomainShift1 # Tasks: DomainShift1 (COCO-seg -> Retinography-seg); CAMTL (Retinography-seg -> Angiography: vessel-seg + stenosis-det);
+mode: train 
 model: ../models/camtl_yolov8.yaml
 data: ../data/data.yaml
 
