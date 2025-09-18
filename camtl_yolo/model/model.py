@@ -28,8 +28,8 @@ class CAMTL_YOLO(DetectionModel):
     """
 
     def __init__(self, cfg='camtl_yolov8.yaml', ch=3, nc=None, verbose=True):
-        """Initializes the model, parses the YAML config, and builds the network."""
-        super().__init__()  
+        super().__init__()
+        # Load YAML
         if isinstance(cfg, dict):
             self.yaml = cfg
             self.yaml_file = Path(__file__).resolve().parents[2] / "configs/models/camtl_yolov8.yaml"
@@ -37,20 +37,21 @@ class CAMTL_YOLO(DetectionModel):
             self.yaml_file = Path(cfg).name
             with open(cfg, 'r', encoding='utf-8') as f:
                 self.yaml = yaml.safe_load(f)
-        
-        # Get pretrained model paths from hyperparameters
-        pretrained_path = self.yaml.get('PRETRAINED_MODELS_PATH')
-        scale = self.yaml.get('SCALE', 's')
-        
-        # Define paths for pretrained weights
-        self.seg_weights = Path(pretrained_path) / f"yolov8{scale}-seg.pt"
-        self.det_weights = Path(pretrained_path) / f"yolov8{scale}.pt"
 
-        # Parse the model structure from YAML
-        self.model, self.save = self.parse_model(self.yaml, ch=[ch] if isinstance(ch, int) else ch, nc=nc)
-        
-        # Load pretrained weights
-        self._load_pretrained_weights()
+        # Common knobs
+        self.task = str(self.yaml.get("TASK", "DomainShift1"))
+        self.scale = str(self.yaml.get("SCALE", "s"))
+        self.pretrained_root = Path(self.yaml.get("PRETRAINED_MODELS_PATH", "."))
+
+        # Default COCO pretrained paths (used in DomainShift1)
+        self.seg_weights = self.pretrained_root / f"yolov8{self.scale}-seg.pt"
+        self.det_weights = self.pretrained_root / f"yolov8{self.scale}.pt"
+
+        # Build architecture
+        self.model, self.save = self.parse_model(self.yaml, ch=[ch] if isinstance(ch, int) else ch, nc=nc, verbose=verbose)
+
+        # Task-aware weight loading
+        self._load_task_weights()
 
     def _forward_once(self, x):
         """
@@ -232,6 +233,160 @@ class CAMTL_YOLO(DetectionModel):
             f"Pretrained load summary: loaded={loaded}, skipped={skipped}, "
             f"shape_mismatch={mismatched}, det_mapped={det_loaded}/{det_total_eligible}"
         )
+
+    # --- Task-aware weight loading and saving ---------------------------------
+
+    def _load_task_weights(self) -> None:
+        """
+        Load weights based on YAML TASK:
+          - DomainShift1: COCO seg + COCO det (mapped) [strict mapping]
+          - CAMTL: fine-tuned checkpoint from DomainShift1 (single .pt)
+        """
+        if self.task == "DomainShift1":
+            self._load_coco_pretrained_weights()
+            return
+
+        if self.task == "CAMTL":
+            ckpt_path = self.pretrained_root / f"yolov8{self.scale}-domainshift1.pt"
+            if not ckpt_path.exists():
+                raise FileNotFoundError(f"[CAMTL] DomainShift1 checkpoint not found: {ckpt_path}")
+
+            # Ensure seg-stream normalization is GN before loading if your DomainShift1 used GN
+            try:
+                from camtl_yolo.model.utils.normalization import replace_seg_stream_bn_with_groupnorm
+                replaced = replace_seg_stream_bn_with_groupnorm(self, max_groups=int(self.yaml.get("GN_GROUPS", 32)))
+                if replaced:
+                    LOGGER.info(f"[CAMTL] Converted {replaced} BN layers to GroupNorm in segmentation stream before loading.")
+            except Exception as e:
+                LOGGER.warning(f"[CAMTL] GN conversion skipped: {e}")
+
+            self._load_finetuned_weights(ckpt_path)
+            return
+
+        LOGGER.warning(f"[TASK={self.task}] Unknown task. Skipping pretrained loading.")
+
+    def _load_coco_pretrained_weights(self):
+        """DomainShift1: backbone+neck from *seg* ckpt, Detect head from *det* ckpt with safe remap."""
+        if not self.seg_weights.exists():
+            raise FileNotFoundError(f"Segmentation weights not found at {self.seg_weights}")
+        if not self.det_weights.exists():
+            raise FileNotFoundError(f"Detection weights not found at {self.det_weights}")
+
+        LOGGER.info(f"Loading backbone and neck from {self.seg_weights}...")
+        ckpt_seg = torch.load(self.seg_weights, map_location="cpu", weights_only=False)
+        csd_seg = ckpt_seg["model"].float().state_dict()
+
+        LOGGER.info(f"Loading detection head from {self.det_weights}...")
+        ckpt_det = torch.load(self.det_weights, map_location="cpu", weights_only=False)
+        csd_det = ckpt_det["model"].float().state_dict()
+
+        new_sd = self.state_dict()
+        det_idx = _find_idx(self.model, Detect)
+
+        loaded, skipped, mismatched = 0, 0, 0
+        det_loaded, det_total_eligible = 0, 0
+
+        # Backbone+neck from yolov8*-seg.pt (exclude seg head 'model.22.')
+        for k, v in csd_seg.items():
+            if k.startswith("model.22."):
+                skipped += 1
+                continue
+            if k in new_sd and new_sd[k].shape == v.shape:
+                new_sd[k] = v
+                loaded += 1
+            else:
+                mismatched += 1
+
+        # Detect head from yolov8*.pt → our Detect index; ignore classification if nc differs
+        if det_idx is None:
+            LOGGER.warning("Detect head not found; skipping detect-head remap")
+        else:
+            model_nc = getattr(self.model[det_idx], "nc", None)
+            coco_nc = ckpt_det["model"].nc if hasattr(ckpt_det["model"], "nc") else 80
+            skip_cls = (model_nc is not None) and (int(model_nc) != int(coco_nc))
+
+            for k_det, v_det in csd_det.items():
+                if not k_det.startswith("model.22."):
+                    continue
+                sub = k_det.split("model.22.", 1)[1]
+                if skip_cls and sub.startswith("cv3"):
+                    skipped += 1
+                    continue
+                new_k = f"model.{det_idx}.{sub}"
+                det_total_eligible += 1
+                if new_k in new_sd and new_sd[new_k].shape == v_det.shape:
+                    new_sd[new_k] = v_det
+                    loaded += 1
+                    det_loaded += 1
+                else:
+                    mismatched += 1
+                    LOGGER.warning(f"Could not map {k_det} -> {new_k} (missing or shape mismatch)")
+
+        self.load_state_dict(new_sd, strict=False)
+        LOGGER.info(
+            f"Pretrained load summary: loaded={loaded}, skipped={skipped}, "
+            f"shape_mismatch={mismatched}, det_mapped={det_loaded}/{det_total_eligible}"
+        )
+
+    def _load_finetuned_weights(self, ckpt_path: Path) -> None:
+        """
+        CAMTL: load a single fine-tuned checkpoint produced after DomainShift1.
+        Accepts Ultralytics-style {'model': nn.Module, ...} or raw state_dict under 'model'.
+        """
+        LOGGER.info(f"[CAMTL] Loading fine-tuned checkpoint from {ckpt_path} ...")
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+
+        if isinstance(ckpt, dict) and "model" in ckpt:
+            src = ckpt["model"]
+            state_src = src.state_dict() if hasattr(src, "state_dict") else dict(ckpt["model"])
+        elif isinstance(ckpt, dict):
+            # assume already a state_dict
+            state_src = ckpt
+        else:
+            # loaded a bare nn.Module
+            state_src = ckpt.state_dict()  # type: ignore[attr-defined]
+
+        state_dst = self.state_dict()
+        loaded, skipped, mismatched = 0, 0, 0
+
+        for k, v in state_src.items():
+            if k in state_dst and state_dst[k].shape == v.shape:
+                state_dst[k] = v
+                loaded += 1
+            else:
+                mismatched += 1
+
+        self.load_state_dict(state_dst, strict=False)
+        LOGGER.info(f"[CAMTL] Load summary: loaded={loaded}, mismatched_or_missing={mismatched}, skipped={skipped}")
+
+    @torch.no_grad()
+    def save_task_checkpoint(self, save_dir: str | Path, filename: str | None = None,
+                             epoch: int | None = None, optimizer=None, extra: dict | None = None) -> Path:
+        """
+        Save a task-aware checkpoint:
+          - DomainShift1 -> yolov8{SCALE}-domainshift1.pt
+          - CAMTL       -> yolov8{SCALE}-camtl.pt
+        Stores an Ultralytics-compatible dict with 'model' = this Module.
+        """
+        save_dir = Path(save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        if filename is None:
+            suffix = "domainshift1" if self.task == "DomainShift1" else "camtl" if self.task == "CAMTL" else "custom"
+            filename = f"yolov8{self.scale}-{suffix}.pt"
+
+        ckpt = {
+            "model": self.float(),  # store in FP32 for portability
+            "epoch": int(epoch or 0),
+            "optimizer": (optimizer.state_dict() if optimizer is not None else None),
+            "yaml": self.yaml,
+            "args": {"task": self.task, "scale": self.scale},
+            "extra": extra or {},
+        }
+        out = save_dir / filename
+        torch.save(ckpt, out)
+        LOGGER.info(f"Saved checkpoint: {out}")
+        return out
 
     def parse_model(self, d: dict, ch, nc: int | None = None, verbose: bool = True):
         """

@@ -1,19 +1,11 @@
-# camtl_yolo/train/tasks.py
+# camtl_yolo/train/tasks.py  (updated)
 """
-Task configuration and model freezing utilities.
-
-Implements "DomainShift1":
-- Start from COCO weights (already loaded by CAMTL_YOLO).
-- Use only retinography segmentation data.
-- Freeze Detect head parameters; set BN under Detect to eval().
-- Keep backbone+neck+FPMA+CTAM+CSAM trainable.
-- Attach L2-SP over backbone+neck to reduce forgetting.
-
-Exposes
--------
-- select_dataset_tasks_for_mode(mode) -> dict[split -> list[str]]
-- configure_task(model, mode, l2sp_lambda) -> TaskState
-- parameter_groups(model) -> dict[str, list[nn.Parameter]]
+Task configuration for DomainShift1 and CAMTL.
+- Dataset key selection per mode.
+- Normalization setup:
+    * DomainShift1: keep default BN in backbone; set GN in Seg stream.
+    * CAMTL: Dual BN in backbone+Detect, GN in Seg stream.
+- L2-SP attachment.
 """
 from __future__ import annotations
 
@@ -22,13 +14,30 @@ from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
-
 from camtl_yolo.external.ultralytics.ultralytics.nn.modules import Detect
 from camtl_yolo.model.nn import CTAM, CSAM, FPMA, SegHead
 from camtl_yolo.model.losses.regularizers import L2SPRegularizer, snapshot_reference
-from camtl_yolo.external.ultralytics.ultralytics.utils import LOGGER    
+from camtl_yolo.external.ultralytics.ultralytics.utils import LOGGER
+from camtl_yolo.model.utils.normalization import convert_backbone_and_detect_to_dual_bn, replace_seg_stream_bn_with_groupnorm
 
-# ----------------------------- Grouping ----------------------------- #
+
+# ----------------------------- Dataset selection ----------------------------- #
+
+def select_dataset_tasks_for_mode(mode: str) -> Dict[str, List[str]]:
+    m = str(mode)
+    if m == "DomainShift1":
+        keys = ["retinography_segmentation"]
+        return {"train": keys, "val": keys, "test": keys}
+    if m == "CAMTL":
+        # Angiography-only in phase 2; both tasks
+        tr = ["angiography_detection", "angiography_segmentation"]
+        return {"train": tr, "val": tr, "test": tr}
+    # Fallback: everything
+    allk = ["retinography_segmentation", "angiography_segmentation", "angiography_detection"]
+    return {"train": allk, "val": allk, "test": allk}
+
+
+# ----------------------------- Groups ----------------------------- #
 
 def _is_attention(m: nn.Module) -> bool:
     return isinstance(m, (CTAM, CSAM, FPMA))
@@ -41,7 +50,6 @@ def _set_bn_eval(module: nn.Module) -> None:
 
 
 def freeze_detect_head(model: nn.Module, bn_eval: bool = True) -> List[str]:
-    """Freeze parameters of Ultralytics Detect head(s)."""
     frozen: List[str] = []
     for mod in model.modules():
         if isinstance(mod, Detect):
@@ -55,9 +63,6 @@ def freeze_detect_head(model: nn.Module, bn_eval: bool = True) -> List[str]:
 
 
 def parameter_groups(model: nn.Module) -> Dict[str, List[nn.Parameter]]:
-    """
-    Split parameters into semantic groups for optimizer config.
-    """
     groups: Dict[str, List[nn.Parameter]] = {
         "backbone_neck": [], "attention": [], "seg_head": [], "detect_head": [], "other": []
     }
@@ -76,24 +81,6 @@ def parameter_groups(model: nn.Module) -> Dict[str, List[nn.Parameter]]:
     return groups
 
 
-# ----------------------------- Task selection ----------------------------- #
-
-def select_dataset_tasks_for_mode(mode: str) -> Dict[str, List[str]]:
-    """
-    Map training mode -> list of JSON keys to include per split.
-    """
-    mode = str(mode)
-    if mode == "DomainShift1":
-        keys = ["retinography_segmentation"]
-        return {"train": keys, "val": keys, "test": keys}
-    # Default: include everything
-    return {
-        "train": ["retinography_segmentation", "angiography_segmentation", "angiography_detection"],
-        "val":   ["retinography_segmentation", "angiography_segmentation", "angiography_detection"],
-        "test":  ["retinography_segmentation", "angiography_segmentation", "angiography_detection"],
-    }
-
-
 # ----------------------------- Task application ----------------------------- #
 
 @dataclass
@@ -109,38 +96,58 @@ def configure_task(
     mode: str = "DomainShift1",
     l2sp_lambda: float = 1e-4,
     device: Optional[torch.device] = None,
+    gn_groups: int = 32,
 ) -> TaskState:
     """
-    Apply a task mode configuration in-place and return the TaskState.
+    Apply mode-specific configuration and attach L2-SP.
+    Also applies normalization strategy per mode.
     """
     mode = str(mode)
     l2sp: Optional[L2SPRegularizer] = None
     frozen: List[str] = []
 
     if mode == "DomainShift1":
+        # Normalization: GN in segmentation stream; keep single BN elsewhere
+        gn_repl = replace_seg_stream_bn_with_groupnorm(model, max_groups=gn_groups)
+        LOGGER.info(f"Seg-stream GroupNorm replacements: {gn_repl}")
+        # Freeze Detect
         frozen = freeze_detect_head(model, bn_eval=True)
-
+        # L2-SP over backbone/neck
         include_names: set[str] = set()
         for n, p in model.named_parameters():
             if not p.requires_grad:
                 continue
-            if any(tag in n for tag in (".cv2.", ".cv3.", ".dfl.", "SegHead")):
-                continue
-            if any(tag in n for tag in ("CTAM", "CSAM", "FPMA")):
+            if any(tag in n for tag in (".cv2.", ".cv3.", ".dfl.", "SegHead", "CTAM", "CSAM", "FPMA")):
                 continue
             include_names.add(n)
+        def _include(name: str, param: nn.Parameter) -> bool: return name in include_names
+        ref = snapshot_reference(model, _include, device=device)
+        l2sp = L2SPRegularizer(ref=ref, include=_include, weight=float(l2sp_lambda), device=device)
 
-        def _include(name: str, param: nn.Parameter) -> bool:
-            return name in include_names
-
+    elif mode == "CAMTL":
+        # Normalization: Dual BN in backbone+Detect; GN in segmentation stream
+        gn_repl = replace_seg_stream_bn_with_groupnorm(model, max_groups=gn_groups)
+        dualbn_repl = convert_backbone_and_detect_to_dual_bn(model)
+        LOGGER.info(f"Seg-stream GroupNorm replacements: {gn_repl}; DualBN conversions: {dualbn_repl}")
+        # Unfreeze Detect head for joint training
+        # (If previously frozen, ensure requires_grad=True)
+        for mod in model.modules():
+            if isinstance(mod, Detect):
+                for p in mod.parameters(recurse=True):
+                    p.requires_grad = True
+        # L2-SP still on backbone/neck
+        include_names: set[str] = set()
+        for n, p in model.named_parameters():
+            if any(tag in n for tag in (".cv2.", ".cv3.", ".dfl.", "SegHead", "CTAM", "CSAM", "FPMA")):
+                continue
+            include_names.add(n)
+        def _include(name: str, param: nn.Parameter) -> bool: return name in include_names
         ref = snapshot_reference(model, _include, device=device)
         l2sp = L2SPRegularizer(ref=ref, include=_include, weight=float(l2sp_lambda), device=device)
 
     else:
         LOGGER.warning(f"Unknown task mode '{mode}'. No changes applied.")
 
-    # Attach L2-SP callable on the model for use inside model.loss()
     setattr(model, "_l2sp", l2sp)
-
     groups = parameter_groups(model)
     return TaskState(mode=mode, l2sp=l2sp, frozen_names=frozen, param_groups=groups)

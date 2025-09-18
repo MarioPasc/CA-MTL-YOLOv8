@@ -1,3 +1,15 @@
+SCALE: s # model scale: n, s, m, l, x
+PRETRAINED_MODELS_PATH: /media/mpascual/PortableSSD/Coronariografías/CAMTL_YOLO/pretrained_models/
+# We need the task to know which pretrained weights we have to load:
+# TASK: DomainShift1 -> We expect COCO-seg weights as input: Two files in PRETRAINED_MODELS_PATH:
+#   yolov8{SCALE}-seg.pt  (for backbone+neck+seg head)
+#   yolov8{SCALE}.pt      (for detection head)
+# TASK: CAMTL -> We expect Retinography-seg weights as input: One file in PRETRAINED_MODELS_PATH:
+#   yolov8{SCALE}-domainshift1.pt  (for backbone + neck + attention blocks+ seg head + detection head)
+# NOTE: Please, make sure you have the same task pointed in your hyperparams.yaml file
+TASK: DomainShift1
+# Tasks: DomainShift1 (COCO-seg -> Retinography-seg); CAMTL (Retinography-seg -> Angiography: vessel-seg + stenosis-det);
+
 nc: 1
 scales:
   n: [0.33, 0.25, 1024]
@@ -5,8 +17,6 @@ scales:
   m: [0.67, 0.75, 768]
   l: [1.00, 1.00, 512]
   x: [1.00, 1.25, 512]
-PRETRAINED_MODELS_PATH: /media/mpascual/PortableSSD/Coronariografías/CAMTL_YOLO/pretrained_models/COCO
-SCALE: s # model scale: n, s, m, l, x
 
 # ===== Backbone (YOLOv8) =====
 backbone:
