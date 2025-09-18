@@ -9,11 +9,11 @@ from camtl_yolo.external.ultralytics.ultralytics.nn.modules import (
     BottleneckCSP, C1, C2, C2f, C3, C3TR, C3Ghost, DWConvTranspose2d, C3x, RepC3, Concat, Detect, Segment)
 from camtl_yolo.external.ultralytics.ultralytics.nn.tasks import DetectionModel
 from camtl_yolo.external.ultralytics.ultralytics.utils import LOGGER
-from camtl_yolo.external.ultralytics.ultralytics.utils.loss import v8DetectionLoss
 from camtl_yolo.external.ultralytics.ultralytics.utils.ops import make_divisible
 
 # Cross-Attention Multi-Task Learning modules
 from camtl_yolo.model.nn import CSAM, CTAM, FPMA, SegHead
+from camtl_yolo.model.losses import DetectionLoss, MultiScaleBCEDiceLoss, ConsistencyMaskFromBoxes, AttentionAlignmentLoss
 
 def _find_idx(modules, cls):
     for i, m in enumerate(modules):
@@ -75,45 +75,94 @@ class CAMTL_YOLO(DetectionModel):
 
 
     def init_criterion(self):
-        """Initializes the loss functions for multi-task training."""
-        # This would be called by your custom CAMTLTrainer
-        # self.detect_criterion = v8DetectionLoss(...)
-        # self.segment_criterion = SegmentationLoss(...)
-        # self.consistency_criterion = ConsistencyLoss(...)
-        LOGGER.info("Custom multi-task criterion initialized.")
-        # For now, we can just return a placeholder
-        return nn.CrossEntropyLoss() # Placeholder
+        """
+        Initialize multi-task criteria.
+        Reads optional weights from self.yaml['LOSS'].
+        """
+        cfg = self.yaml.get("LOSS", {}) if isinstance(self.yaml, dict) else {}
+        # Detection loss from Ultralytics (uses model internals)
+        self.detect_criterion = DetectionLoss(self, hyp=cfg.get("det_hyp"))
+        # Segmentation loss: BCE+Dice at one or more scales
+        seg_scales = cfg.get("seg_scale_weights")  # e.g., [0.25, 0.35, 0.40]
+        self.segment_criterion = MultiScaleBCEDiceLoss(
+            bce_weight=float(cfg.get("seg_bce", 1.0)),
+            dice_weight=float(cfg.get("seg_dice", 1.0)),
+            scale_weights=seg_scales,
+            from_logits=bool(cfg.get("seg_from_logits", True)),
+        )
+        # Consistency: boxes → pseudo-mask on detection-domain images
+        self.consistency_criterion = ConsistencyMaskFromBoxes(
+            weight=float(cfg.get("consistency", 0.1)),
+            loss=str(cfg.get("consistency_loss", "bce")).lower(),
+        )
+        # Attention alignment between domains using CTAM attention snapshots
+        self.align_criterion = AttentionAlignmentLoss(
+            model=self,
+            source_name=str(cfg.get("source_domain", "retinography")),
+            target_name=str(cfg.get("target_domain", "angiography")),
+            weight=float(cfg.get("align", 0.1)),
+        )
+        # scalar weights for combining
+        self._lambda_det = float(cfg.get("lambda_det", 1.0))
+        self._lambda_seg = float(cfg.get("lambda_seg", 1.0))
+        self._lambda_cons = float(cfg.get("lambda_cons", 0.1))
+        self._lambda_align = float(cfg.get("lambda_align", 0.1))
+        return True
 
     def loss(self, batch, preds):
         """
-        Computes the combined loss for detection, segmentation, and auxiliary tasks.
+        Compute total multi-task loss for a mixed batch.
+        - Detection loss on batches with detection labels.
+        - Segmentation loss on batches flagged as segmentation.
+        - Consistency loss on detection-domain images using GT boxes as pseudo masks.
+        - Attention alignment loss across domains if CTAM attention is available.
+        - Optional L2-SP regularization if tasks.configure_task attached self._l2sp.
         """
-        # This method will be called by your CAMTLTrainer during the training loop.
-        
-        # 1. Unpack predictions
         det_preds, seg_preds = preds
-        
-        # 2. Calculate detection loss
-        # loss_det, loss_det_items = self.detect_criterion(det_preds, batch)
-        
-        # 3. Calculate segmentation loss
-        # loss_seg, loss_seg_items = self.segment_criterion(seg_preds, batch)
-        
-        # 4. Calculate auxiliary losses (consistency, etc.)
-        # loss_aux, loss_aux_items = self.consistency_criterion(...)
-        
-        # 5. Combine losses
-        # total_loss = loss_det + loss_seg + loss_aux
-        # loss_items = {**loss_det_items, **loss_seg_items, **loss_aux_items}
-        
-        # Placeholder implementation
-        LOGGER.info("Calculating combined loss (placeholder).")
-        total_loss = torch.tensor(0.0, device=batch['img'].device, requires_grad=True)
-        loss_items = {'loss': total_loss}
+        device = batch["img"].device
 
-        return total_loss, loss_items
+        # detection
+        has_det = batch["bboxes"].numel() > 0
+        loss_det = torch.zeros((), device=device)
+        det_items = {}
+        if has_det:
+            loss_det, det_items = self.detect_criterion(det_preds, batch)
 
-# --- in model.py: replace _load_pretrained_weights entirely ---
+        # segmentation (only if any seg sample exists in batch)
+        has_seg = bool(batch["is_seg"].any().item()) if isinstance(batch["is_seg"], torch.Tensor) else any(batch["is_seg"])
+        loss_seg = torch.zeros((), device=device)
+        seg_items = {}
+        if has_seg:
+            loss_seg, seg_items = self.segment_criterion(seg_preds, batch)
+
+        # consistency on detection-domain images
+        cons_loss, cons_items = self.consistency_criterion(seg_preds, batch)
+
+        # attention alignment between domains
+        align_loss, align_items = self.align_criterion(batch)
+
+        # L2-SP if configured by task
+        l2sp_term = torch.zeros((), device=device)
+        if hasattr(self, "_l2sp") and self._l2sp is not None:
+            l2sp_term = self._l2sp(self)
+
+        total = (
+            self._lambda_det * loss_det
+            + self._lambda_seg * loss_seg
+            + self._lambda_cons * cons_loss
+            + self._lambda_align * align_loss
+            + l2sp_term
+        )
+
+        items = {}
+        items.update({f"det_{k}": v for k, v in det_items.items()})
+        items.update(seg_items)
+        items.update(cons_items)
+        items.update(align_items)
+        items["l2sp"] = l2sp_term.detach()
+        items["loss"] = total.detach()
+        return total, items
+    
     def _load_pretrained_weights(self):
         """Load COCO weights: backbone+neck from *seg* ckpt, Detect head from *det* ckpt.
         Skip classification branches when nc!=COCO_nc to avoid shape errors.

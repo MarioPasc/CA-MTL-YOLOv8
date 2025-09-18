@@ -112,26 +112,18 @@ def configure_task(
 ) -> TaskState:
     """
     Apply a task mode configuration in-place and return the TaskState.
-
-    DomainShift1:
-        - Freeze Detect head.
-        - L2-SP over backbone+neck parameters using current weights as reference.
-          Exclude attention modules and heads from L2-SP.
     """
     mode = str(mode)
     l2sp: Optional[L2SPRegularizer] = None
     frozen: List[str] = []
 
     if mode == "DomainShift1":
-        # 1) Freeze detector
         frozen = freeze_detect_head(model, bn_eval=True)
 
-        # 2) Build inclusion set for L2-SP: include conv layers in backbone/neck only
         include_names: set[str] = set()
         for n, p in model.named_parameters():
             if not p.requires_grad:
                 continue
-            # Exclude heads and attention by name hints
             if any(tag in n for tag in (".cv2.", ".cv3.", ".dfl.", "SegHead")):
                 continue
             if any(tag in n for tag in ("CTAM", "CSAM", "FPMA")):
@@ -146,6 +138,9 @@ def configure_task(
 
     else:
         LOGGER.warning(f"Unknown task mode '{mode}'. No changes applied.")
+
+    # Attach L2-SP callable on the model for use inside model.loss()
+    setattr(model, "_l2sp", l2sp)
 
     groups = parameter_groups(model)
     return TaskState(mode=mode, l2sp=l2sp, frozen_names=frozen, param_groups=groups)
