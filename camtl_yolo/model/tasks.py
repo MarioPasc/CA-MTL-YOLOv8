@@ -18,7 +18,11 @@ from camtl_yolo.external.ultralytics.ultralytics.nn.modules import Detect
 from camtl_yolo.model.nn import CTAM, CSAM, FPMA, SegHead
 from camtl_yolo.model.losses.regularizers import L2SPRegularizer, snapshot_reference
 from camtl_yolo.external.ultralytics.ultralytics.utils import LOGGER
-from camtl_yolo.model.utils.normalization import convert_backbone_and_detect_to_dual_bn, replace_seg_stream_bn_with_groupnorm
+from camtl_yolo.model.utils.normalization import (
+    convert_backbone_and_detect_to_dual_bn, 
+    replace_seg_stream_bn_with_groupnorm,
+    assert_no_module_cycles
+)
 
 
 # ----------------------------- Dataset selection ----------------------------- #
@@ -109,6 +113,7 @@ def configure_task(
     if mode == "DomainShift1":
         # Normalization: GN in segmentation stream; keep single BN elsewhere
         gn_repl = replace_seg_stream_bn_with_groupnorm(model, max_groups=gn_groups)
+        assert_no_module_cycles(model)
         LOGGER.info(f"Seg-stream GroupNorm replacements: {gn_repl}")
         # Freeze Detect
         frozen = freeze_detect_head(model, bn_eval=True)
@@ -128,6 +133,7 @@ def configure_task(
         # Normalization: Dual BN in backbone+Detect; GN in segmentation stream
         gn_repl = replace_seg_stream_bn_with_groupnorm(model, max_groups=gn_groups)
         dualbn_repl = convert_backbone_and_detect_to_dual_bn(model)
+        assert_no_module_cycles(model)
         LOGGER.info(f"Seg-stream GroupNorm replacements: {gn_repl}; DualBN conversions: {dualbn_repl}")
         # Unfreeze Detect head for joint training
         # (If previously frozen, ensure requires_grad=True)

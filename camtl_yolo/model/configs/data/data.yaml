@@ -15,4 +15,4 @@
 # datasets already preprocessed and ready to use using this Google Drive link:
 # https://drive.google.com/drive/folders/10qBYj3A_OTis2zUm55f5S0pZwHTyBeaa?usp=sharing 
 
-root: /media/mpascual/PortableSSD/Coronariografías/datasets/processed_data
+root: /media/mpascual/PortableSSD/Coronariografías/CAMTL_YOLO/processed_data

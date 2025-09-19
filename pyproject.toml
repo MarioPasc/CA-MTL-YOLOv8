@@ -62,6 +62,4 @@ ultralytics = "camtl_yolo/external/ultralytics/ultralytics"
 "ultralytics" = ["*"]
 
 [project.scripts]
-camtl_yolo_train = "camtl_yolo.cli.train:main"
-camtl-yolo-train = "camtl_yolo.cli.train:main"
 "camtl_yolo.train" = "camtl_yolo.cli.train:main"

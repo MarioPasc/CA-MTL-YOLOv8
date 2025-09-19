@@ -15,6 +15,7 @@ from camtl_yolo.external.ultralytics.ultralytics.utils import LOGGER
 # Cross-Attention Multi-Task Learning modules
 from camtl_yolo.model.nn import CSAM, CTAM, FPMA, SegHead
 from camtl_yolo.model.losses import DetectionLoss, MultiScaleBCEDiceLoss, ConsistencyMaskFromBoxes, AttentionAlignmentLoss
+from camtl_yolo.model.utils.normalization import replace_seg_stream_bn_with_groupnorm, assert_no_module_cycles
 
 def _find_idx(modules, cls):
     for i, m in enumerate(modules):
@@ -380,8 +381,8 @@ class CAMTL_YOLO(DetectionModel):
 
             # Ensure seg-stream normalization is GN before loading if your DomainShift1 used GN
             try:
-                from camtl_yolo.model.utils.normalization import replace_seg_stream_bn_with_groupnorm
                 replaced = replace_seg_stream_bn_with_groupnorm(self, max_groups=int(self.yaml.get("GN_GROUPS", 32)))
+                assert_no_module_cycles(self)
                 if replaced:
                     LOGGER.info(f"[CAMTL] Converted {replaced} BN layers to GroupNorm in segmentation stream before loading.")
             except Exception as e:

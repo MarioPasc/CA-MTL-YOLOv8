@@ -1,5 +1,5 @@
 SCALE: s # model scale: n, s, m, l, x
-PRETRAINED_MODELS_PATH: /media/mpascual/PortableSSD/Coronariografías/CAMTL_YOLO/pretrained_models/
+PRETRAINED_MODELS_PATH: /media/mpascual/PortableSSD/Coronariografías/CAMTL_YOLO/pretrained_models/COCO
 # We need the task to know which pretrained weights we have to load:
 # TASK: DomainShift1 -> We expect COCO-seg weights as input: Two files in PRETRAINED_MODELS_PATH:
 #   yolov8{SCALE}-seg.pt  (for backbone+neck+seg head)

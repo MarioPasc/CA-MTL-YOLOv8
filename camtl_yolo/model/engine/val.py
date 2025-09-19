@@ -13,6 +13,7 @@ from camtl_yolo.external.ultralytics.ultralytics.engine.validator import BaseVal
 from camtl_yolo.external.ultralytics.ultralytics.utils import LOGGER
 from camtl_yolo.external.ultralytics.ultralytics.utils.torch_utils import smart_inference_mode, unwrap_model
 
+from types import SimpleNamespace
 
 class CAMTLValidator(BaseValidator):
     """
@@ -26,6 +27,18 @@ class CAMTLValidator(BaseValidator):
     def __init__(self, dataloader=None, save_dir=None, args=None, _callbacks=None) -> None:
         super().__init__(dataloader, save_dir, args, _callbacks)
         self.args.task = "detect+segment"
+
+        self.metrics = SimpleNamespace(
+            keys=[
+                "val/det",
+                "val/seg",
+                "val/cons",
+                "val/align",
+                "val/l2sp",
+                "val/total",
+                "val/dice",
+            ]
+        )
 
     def preprocess(self, batch: Dict[str, Any]) -> Dict[str, Any]:
         for k, v in batch.items():

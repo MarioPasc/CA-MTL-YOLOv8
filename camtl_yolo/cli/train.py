@@ -180,7 +180,7 @@ def main(argv: List[str] | None = None) -> int:
     from camtl_yolo.model.engine.train import CAMTLTrainer
 
     # Kick off training
-    trainer = CAMTLTrainer(overrides=cfg)
+    trainer = CAMTLTrainer(cfg=cfg)
     trainer.train()
     return 0
 

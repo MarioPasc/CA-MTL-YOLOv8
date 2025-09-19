@@ -44,6 +44,35 @@ def bn_domain(domain: str):
     finally:
         set_bn_domain(prev)
 
+def _dfs_cycle_detect(root: nn.Module) -> str | None:
+    """Return a dotted path to a node where a cycle is detected, else None."""
+    visited, stack = set(), set()
+
+    def dfs(m: nn.Module, path: list[str]) -> str | None:
+        mid = id(m)
+        if mid in stack:
+            return ".".join(path + ["<cycle>"])
+        if mid in visited:
+            return None
+        stack.add(mid)
+        for name, ch in m._modules.items():
+            if ch is None:
+                continue
+            got = dfs(ch, path + [name])
+            if got is not None:
+                return got
+        stack.remove(mid)
+        visited.add(mid)
+        return None
+
+    return dfs(root, ["root"])
+
+
+def assert_no_module_cycles(root: nn.Module) -> None:
+    p = _dfs_cycle_detect(root)
+    if p is not None:
+        raise RuntimeError(f"Module graph contains a cycle along path: {p}")
+
 
 # ----------------------------- Dual BN ----------------------------- #
 
@@ -118,90 +147,93 @@ def _pick_gn_groups(channels: int, max_groups: int = 32) -> int:
 
 def replace_seg_stream_bn_with_groupnorm(model: nn.Module, max_groups: int = 32) -> int:
     """
-    Replace nn.BatchNorm2d found under Segmentation-specific modules with GroupNorm.
-
-    Segmentation-specific modules: SegHead, FPMA, CTAM.
-    Returns count of layers replaced.
+    Replace nn.BatchNorm2d under SegHead/FPMA/CTAM subtrees with GroupNorm.
+    Returns number of layers replaced.
     """
     from camtl_yolo.model.nn import SegHead, FPMA, CTAM  # local types
-
-    replaced = 0
 
     def _convert_bn_to_gn(bn: nn.BatchNorm2d) -> nn.GroupNorm:
         gn = nn.GroupNorm(num_groups=_pick_gn_groups(bn.num_features, max_groups),
                           num_channels=bn.num_features, eps=bn.eps, affine=True)
-        # Copy affine if present
         with torch.no_grad():
             if bn.affine:
                 gn.weight.copy_(bn.weight.data)
                 gn.bias.copy_(bn.bias.data)
         return gn
 
-    def _visit(root: nn.Module):
+    replaced = 0
+    visited: set[int] = set()
+
+    def visit(root: nn.Module):
         nonlocal replaced
+        mid = id(root)
+        if mid in visited:
+            return
+        visited.add(mid)
+
         for name, child in list(root.named_children()):
-            # If child has attribute 'bn' inside common Ultralytics blocks
+            # 1) common Ultralytics blocks have .bn attribute
             if _replace_module_attr(child, "bn",
                                     lambda old: _convert_bn_to_gn(old) if isinstance(old, nn.BatchNorm2d) else old):
                 replaced += 1
-            # If the child itself is a BN and directly in modules dict
+            # 2) raw BN as direct child
             if isinstance(child, nn.BatchNorm2d):
                 setattr(root, name, _convert_bn_to_gn(child))
                 replaced += 1
+                # stop here; new GN has no children
                 continue
-            # Recurse only under segmentation modules or their descendants
-            if isinstance(child, (SegHead, FPMA, CTAM)) or any(isinstance(p, (SegHead, FPMA, CTAM)) for p in child.modules()):
-                _visit(child)
-            else:
-                # For non-seg branches we do not modify here
-                _visit(child)
+            # 3) descend
+            visit(child)
 
-    # Start from each top-level module that is SegHead/FPMA/CTAM
-    for m in model.modules():
-        if isinstance(m, (SegHead, FPMA, CTAM)):
-            _visit(m)
+    # Only start from segmentation roots to avoid touching backbone/detect
+    seg_roots = [m for m in model.modules() if isinstance(m, (SegHead, FPMA, CTAM))]
+    for r in seg_roots:
+        visit(r)
+
+    # sanity
+    assert_no_module_cycles(model)
     return replaced
 
 
 def convert_backbone_and_detect_to_dual_bn(model: nn.Module) -> int:
     """
-    Convert BN in backbone and Detect head to DualBatchNorm2d.
-    Skips SegHead/FPMA/CTAM subtrees to keep them GN or vanilla.
-
-    Returns number of layers converted.
+    Convert BatchNorm2d in backbone and Detect head to DualBatchNorm2d.
+    Skips SegHead/FPMA/CTAM entirely. Returns number of layers converted.
     """
     from camtl_yolo.model.nn import SegHead, FPMA, CTAM
     from camtl_yolo.external.ultralytics.ultralytics.nn.modules import Detect
 
+    def _should_skip(m: nn.Module) -> bool:
+        return isinstance(m, (SegHead, FPMA, CTAM))
+
     converted = 0
+    visited: set[int] = set()
 
-    def _should_skip(module: nn.Module) -> bool:
-        return isinstance(module, (SegHead, FPMA, CTAM))
-
-    def _convert_bn(bn: nn.BatchNorm2d) -> DualBatchNorm2d:
-        return DualBatchNorm2d.from_bn(bn)
-
-    def _visit(root: nn.Module, in_skipped_subtree: bool = False):
+    def visit(root: nn.Module, skip: bool = False):
         nonlocal converted
-        skip_here = in_skipped_subtree or _should_skip(root)
+        mid = id(root)
+        if mid in visited:
+            return
+        visited.add(mid)
+
+        skip_here = skip or _should_skip(root)
         for name, child in list(root.named_children()):
-            # Option 1: Ultralytics Conv wrapper
             if not skip_here:
                 if _replace_module_attr(child, "bn",
-                                        lambda old: _convert_bn(old) if isinstance(old, nn.BatchNorm2d) else old):
+                                        lambda old: DualBatchNorm2d.from_bn(old) if isinstance(old, nn.BatchNorm2d) else old):
                     converted += 1
-            # Option 2: raw BN children
-            if not skip_here and isinstance(child, nn.BatchNorm2d):
-                setattr(root, name, _convert_bn(child))
-                converted += 1
-                continue
-            _visit(child, in_skipped_subtree=skip_here)
+                if isinstance(child, nn.BatchNorm2d):
+                    setattr(root, name, DualBatchNorm2d.from_bn(child))
+                    converted += 1
+                    continue
+            visit(child, skip_here)
 
-    # Run once over the full model
-    _visit(model, in_skipped_subtree=False)
-    # Ensure Detect head converted even if nested oddly
+    # single pass from the top
+    visit(model, skip=False)
+    # ensure Detect submodules are handled even if nested oddly
     for m in model.modules():
         if isinstance(m, Detect):
-            # Re-run targeted pass inside Detect
-            _visit(m, in_skipped_subtree=False)
+            visit(m, skip=False)
+
+    assert_no_module_cycles(model)
     return converted
