@@ -209,8 +209,19 @@ class MultiTaskJSONDataset(BaseDataset):
                 if bboxes.size:
                     bboxes[:, 1] = 1.0 - bboxes[:, 1]
 
-            img_rgb = img_bgr[..., ::-1]
-            img = torch.from_numpy(img_rgb.transpose(2, 0, 1)).float() / 255.0
+            # Normalize channel layout to contiguous RGB without negative strides
+            if img_bgr.ndim == 2:  # grayscale → BGR
+                img_bgr = cv2.cvtColor(img_bgr, cv2.COLOR_GRAY2BGR)
+            elif img_bgr.shape[2] == 4:  # BGRA → BGR
+                img_bgr = cv2.cvtColor(img_bgr, cv2.COLOR_BGRA2BGR)
+            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)  # contiguous by construction
+            LOGGER.info(
+                f"Image {label.get('im_file', '')}: shape={img_rgb.shape}, "
+                f"bboxes={bboxes.shape if bboxes is not None else None}, "
+                f"mask={mask.shape if mask is not None else None}"
+            )
+            chw = np.ascontiguousarray(img_rgb.transpose(2, 0, 1))  # ensure positive strides
+            img = torch.from_numpy(chw).float() / 255.0
             out: Dict[str, Any] = {
                 "img": img,
                 "cls": torch.from_numpy(cls).long() if cls.size else torch.zeros((0, 1), dtype=torch.long),

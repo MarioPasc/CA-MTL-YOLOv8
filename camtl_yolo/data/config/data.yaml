@@ -30,7 +30,7 @@ retinography_datasets:
   - CHASEDB1
 # We have hard-coded the insides of the datasets. 
 # If you want to add your own dataset, you will need to modify the code.
-output_dir: /media/mpascual/PortableSSD/Coronariografías/processed_data
+output_dir: /media/mpascual/PortableSSD/Coronariografías/CAMTL_YOLO/processed_data
 
 preprocessing:
   # Image format
