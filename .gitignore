@@ -207,3 +207,9 @@ marimo/_lsp/
 __marimo__/
 
 .github/
+*.pt
+*.pth
+*.ckpt
+*.model
+*.torchscript
+tmp/

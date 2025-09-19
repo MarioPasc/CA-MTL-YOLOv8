@@ -46,17 +46,22 @@ Homepage = "https://github.com/MarioPasc/CA-MLT-YOLOv8"
 [tool.setuptools.packages.find]
 # Discover our main package and the vendored top-level 'ultralytics' package
 include = [
-  "camlt_yolo",
-  "camlt_yolo.*",
+  "camtl_yolo",
+  "camtl_yolo.*",
   "ultralytics",
   "ultralytics.*",
-  "cli",
-  "cli.*",
+  "camtl_yolo.cli",
+  "camtl_yolo.cli.*",
 ]
 
 [tool.setuptools.package-dir]
-ultralytics = "camlt_yolo/external/ultralytics/ultralytics"
+ultralytics = "camtl_yolo/external/ultralytics/ultralytics"
 
 [tool.setuptools.package-data]
-"camlt_yolo.external.ultralytics" = ["*"]
+"camtl_yolo.external.ultralytics" = ["*"]
 "ultralytics" = ["*"]
+
+[project.scripts]
+camtl_yolo_train = "camtl_yolo.cli.train:main"
+camtl-yolo-train = "camtl_yolo.cli.train:main"
+"camtl_yolo.train" = "camtl_yolo.cli.train:main"
