@@ -54,7 +54,14 @@ def _clone_model_from_yaml(src: nn.Module) -> nn.Module:
 class SafeModelEMA:
     def __init__(self, model: nn.Module, decay: float = 0.9999):
         self.decay = float(decay)
+        # Build EMA clone and move it to the same device as the training model
         self.ema = _clone_model_from_yaml(model)
+        try:
+            model_device = next(model.parameters()).device  # may raise StopIteration if no params
+        except StopIteration:
+            model_device = torch.device("cpu")
+        # Keep EMA in float32 for numerical stability, located on the training device
+        self.ema.to(device=model_device, dtype=torch.float32)
         self.updates = 0
         self._ema_params: Dict[str, torch.Tensor] = dict(self.ema.named_parameters())
         self._ema_buffers: Dict[str, torch.Tensor] = dict(self.ema.named_buffers())
@@ -65,7 +72,11 @@ class SafeModelEMA:
         d = self.decay
         for n, p in model.named_parameters():
             if n in self._ema_params:
-                self._ema_params[n].mul_(d).add_(p.detach(), alpha=1.0 - d)
+                dst = self._ema_params[n]
+                src = p.detach().to(device=dst.device, dtype=dst.dtype)
+                dst.mul_(d).add_(src, alpha=1.0 - d)
         for n, b in model.named_buffers():
             if n in self._ema_buffers:
-                self._ema_buffers[n].copy_(b)
+                dstb = self._ema_buffers[n]
+                srcb = b.detach().to(device=dstb.device, dtype=dstb.dtype)
+                dstb.copy_(srcb)

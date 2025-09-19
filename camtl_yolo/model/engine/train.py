@@ -290,7 +290,7 @@ class CAMTLTrainer(BaseTrainer):
         for k, v in batch.items():
             if isinstance(v, torch.Tensor):
                 batch[k] = v.to(self.device, non_blocking=True)
-        batch["img"] = batch["img"].float() / 255.0
+        batch["img"] = batch["img"].float()
 
         # Expect single-domain batches; set DualBN switch
         if "bn_domain" in batch and len(batch["bn_domain"]):

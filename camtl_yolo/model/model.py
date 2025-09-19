@@ -242,9 +242,6 @@ class CAMTL_YOLO(DetectionModel):
                 return "[" + ", ".join(_shape_str(t) for t in obj) + "]"
             return type(obj).__name__
 
-        # safe, nested shape logging
-        LOGGER.info(f"Preds shapes: {_shape_str(preds)}")
-
         # Unpack robustly: expect a 2-tuple; if not, assume det-only and set seg=None
         if isinstance(preds, (list, tuple)) and len(preds) == 2:
             det_preds, seg_preds = preds
@@ -298,19 +295,16 @@ class CAMTL_YOLO(DetectionModel):
             + l2sp_term
         )
 
-        items = {}
-        items.update({f"det_{k}": v for k, v in det_items.items()})
-        items.update(seg_items)
-        items.update(cons_items)
-        items.update(align_items)
-        items["l2sp"] = l2sp_term.detach()
-        items["loss"] = total.detach()
-        items.setdefault("det_loss", loss_det.detach())
-        items.setdefault("seg_loss",    loss_seg.detach())
-        items.setdefault("cons_loss",   cons_loss.detach())
-        items.setdefault("align_loss",  align_loss.detach())
-        return total, items
-    
+        loss_items = torch.stack([
+            loss_det.detach(),
+            loss_seg.detach(),
+            cons_loss.detach(),
+            align_loss.detach(),
+            l2sp_term.detach(),
+            total.detach(),
+        ])
+        return total, loss_items
+
     def _load_pretrained_weights(self):
         """Load COCO weights: backbone+neck from *seg* ckpt, Detect head from *det* ckpt.
         Skip classification branches when nc!=COCO_nc to avoid shape errors.
