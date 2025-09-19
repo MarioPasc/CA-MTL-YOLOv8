@@ -10,8 +10,8 @@ name: CA-MTL-YOLOv8
 imgsz: 512 
 
 # Hyperparameters ------------------------------------------------------------------------------------------------------
-epochs: 100 
-batch: 4 
+epochs: 2 
+batch: 2 
 optimizer: auto # (str) optimizer: SGD, Adam, Adamax, AdamW, NAdam, RAdam, RMSProp, or auto
 lr0: 0.01 # (float) initial learning rate (SGD=1e-2, Adam/AdamW=1e-3)
 lrf: 0.01 # (float) final LR fraction; final LR = lr0 * lrf

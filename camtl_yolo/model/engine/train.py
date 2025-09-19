@@ -334,15 +334,16 @@ class CAMTLTrainer(BaseTrainer):
 
     # ------------------------ Progress String ------------------------ #
 
-    def progress_string(self):
-        # Show previous-epoch averaged losses under the progress bar
-        # (BaseTrainer prints this string once per epoch before TQDM)
-        if self._prev_epoch_losses and len(self._prev_epoch_losses) == len(self.loss_names):
-            parts = [
-                f"{name}={val:.4f}" for name, val in zip(self.loss_names, self._prev_epoch_losses)
-            ]
-            return "losses(prev): " + ", ".join(parts)
-        return "losses(prev): n/a"
+
+    def progress_string(self) -> str:  # type: ignore[override]
+        names = tuple(self.loss_names) 
+        return ("\n" + "%11s" * (4 + len(names))) % (
+            "Epoch",
+            "GPU_mem",
+            *names,
+            "Instances",
+            "Size",
+        )
 
     # ------------------------ Callbacks (logging + memory) ------------------------ #
 

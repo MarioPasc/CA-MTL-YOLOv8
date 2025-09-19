@@ -80,3 +80,26 @@ class SafeModelEMA:
                 dstb = self._ema_buffers[n]
                 srcb = b.detach().to(device=dstb.device, dtype=dstb.dtype)
                 dstb.copy_(srcb)
+
+    def update_attr(self, model: nn.Module, include: list[str] | None = None, exclude: list[str] | None = None):
+        """Update simple attributes on the EMA clone from the source model.
+
+        This mirrors the Ultralytics ModelEMA API used by BaseTrainer.
+
+        Args:
+            model: Source model to copy attributes from.
+            include: List of attribute names to copy (e.g., ["yaml", "nc", "args", "names", "stride", "class_weights"]).
+            exclude: Optional list of attribute names to skip (not used here but kept for API compatibility).
+        """
+        if not include:
+            return
+        excl = set(exclude or ())
+        for k in include:
+            if k in excl:
+                continue
+            if hasattr(model, k):
+                try:
+                    setattr(self.ema, k, getattr(model, k))
+                except Exception:
+                    # Be tolerant to non-copyable attrs (e.g., torch.compile wrappers)
+                    pass

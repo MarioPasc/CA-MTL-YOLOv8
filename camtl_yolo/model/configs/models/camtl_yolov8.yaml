@@ -73,4 +73,4 @@ det_head:
   - [32, 1, Detect, [nc]]                          # 33  Detect takes list [D3cs,D4cs,D5cs]
 
 seg_head:
-  - [28, 1, SegHead, []]                      # 34  expose final seg logits (P3)
+  - [[27, 24, 22], 1, SegHeadMulti, []]             # 34  Deep supervision segmentation head (P3,P4,P5) → SegLogits_P3,P4,P5

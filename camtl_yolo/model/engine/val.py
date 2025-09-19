@@ -44,7 +44,7 @@ class CAMTLValidator(BaseValidator):
         for k, v in batch.items():
             if isinstance(v, torch.Tensor):
                 batch[k] = v.to(self.device, non_blocking=True)
-        batch["img"] = (batch["img"].half() if self.args.half else batch["img"].float()) / 255.0
+        batch["img"] = (batch["img"].half() if self.args.half else batch["img"].float()) 
         # set BN domain for this batch
         if "bn_domain" in batch and len(batch["bn_domain"]):
             set_bn_domain(map_domain_name(batch["bn_domain"][0]))
@@ -63,13 +63,33 @@ class CAMTLValidator(BaseValidator):
         self.seg_dice = 0.0
         self.seen = 0
 
-    def _dice(self, p: torch.Tensor, y: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
-        # p: (B,1,H,W) or (B,*,H,W), sigmoid not applied
-        p = (p.sigmoid() > 0.5).float()
+    def _dice(self, pred_logits: torch.Tensor, y: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
+        """
+        Dice on probabilities. Accepts logits or probabilities.
+        Resizes prediction to GT size if needed.
+        pred_logits: [B,1,h,w] or [B,1,H,W] (logits preferred)
+        y:          [B,1,H,W] in {0,1}
+        """
+        if pred_logits.ndim == 3:
+            pred_logits = pred_logits.unsqueeze(1)
+        if y.ndim == 3:
+            y = y.unsqueeze(1)
+
+        # convert to probabilities
+        if pred_logits.dtype.is_floating_point:
+            p = torch.sigmoid(pred_logits)
+        else:
+            p = pred_logits
+
+        # resize to GT size if needed
+        if p.shape[-2:] != y.shape[-2:]:
+            p = F.interpolate(p, size=y.shape[-2:], mode="bilinear", align_corners=False)
+
         y = (y > 0.5).float()
         inter = (p * y).sum(dim=(1, 2, 3))
-        union = p.sum(dim=(1, 2, 3)) + y.sum(dim=(1, 2, 3))
-        return ((2 * inter + eps) / (union + eps)).mean()
+        denom = p.sum(dim=(1, 2, 3)) + y.sum(dim=(1, 2, 3))
+        return ((2 * inter + eps) / (denom + eps)).mean()
+
 
     @smart_inference_mode()
     def __call__(self, trainer=None, model=None):
@@ -94,51 +114,61 @@ class CAMTLValidator(BaseValidator):
         for i, batch in enumerate(self.dataloader):
             self.run_callbacks("on_val_batch_start")
             batch = self.preprocess(batch)
+
+            # forward with EMA/base
             preds = model(batch["img"])
-            # Model must expose .loss(batch, preds) -> (loss_total, items_tensor)
-            loss_total, items = unwrap_model(model).loss(batch, preds)
-            # items order: det, seg, cons, align, l2sp, total
+
+            # compute loss with base (non-EMA) so criteria exist
+            base = unwrap_model(trainer.model)
+            loss_total, items = base.loss(batch, preds)
+
+            # items: tensor [det, seg, cons, align, l2sp, total]
             det, seg, cons, align, l2sp, total = [float(x) for x in items.tolist()]
             is_seg_batch = bool(batch.get("is_seg", torch.tensor([False])).any().item())
+
             if is_seg_batch:
                 self.loss_seg += seg
                 self.count_seg += 1
-                # try to compute dice on primary mask head
+
+                # pick fused full-res logits when available
+                seg_pred = None
                 if isinstance(preds, (tuple, list)) and len(preds) >= 2:
                     seg_pred = preds[1]
                 else:
                     seg_pred = preds
-                # expect (B,1,H,W)
-                if isinstance(seg_pred, (list, tuple)):
-                    seg_pred = seg_pred[0]
-                if seg_pred.ndim == 4 and "mask" in batch:
-                    self.seg_dice += float(self._dice(seg_pred, batch["mask"]))
+
+                if isinstance(seg_pred, dict):
+                    logits = seg_pred.get("full", seg_pred.get("p3", None))
+                else:
+                    logits = seg_pred
+
+                if logits is not None:
+                    self.seg_dice += float(self._dice(logits, batch["mask"]))
             else:
                 self.loss_det += det
                 self.count_det += 1
+
             self.loss_cons += cons
             self.loss_align += align
             self.loss_l2sp += l2sp
             self.seen += batch["img"].shape[0]
             self.run_callbacks("on_val_batch_end")
 
-        # Averages
         md = {
-            "val/det": (self.loss_det / max(1, self.count_det)),
-            "val/seg": (self.loss_seg / max(1, self.count_seg)),
-            "val/cons": (self.loss_cons / max(1, self.count_det + self.count_seg)),
+            "val/det":   (self.loss_det   / max(1, self.count_det)),
+            "val/seg":   (self.loss_seg   / max(1, self.count_seg)),
+            "val/cons":  (self.loss_cons  / max(1, self.count_det + self.count_seg)),
             "val/align": (self.loss_align / max(1, self.count_det + self.count_seg)),
-            "val/l2sp": (self.loss_l2sp / max(1, self.count_det + self.count_seg)),
+            "val/l2sp":  (self.loss_l2sp  / max(1, self.count_det + self.count_seg)),
             "val/total": (
                 (self.loss_det + self.loss_seg + self.loss_cons + self.loss_align + self.loss_l2sp)
                 / max(1, self.count_det + self.count_seg)
             ),
-            "val/dice": (self.seg_dice / max(1, self.count_seg)),
+            "val/dice":  (self.seg_dice   / max(1, self.count_seg)),
         }
 
-        # Pack results for trainer
         self.run_callbacks("on_val_end")
         if self.training:
-            # Reuse BaseTrainer labeler for consistency of CSV columns
             return {**md}
         return md
+

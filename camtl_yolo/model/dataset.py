@@ -11,13 +11,16 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
+from camtl_yolo.model.utils.downsample_mask import downsample_mask_prob 
+
 try:
     from camtl_yolo.external.ultralytics.ultralytics.data.dataset import BaseDataset
 except Exception as e:  # pragma: no cover
     raise ImportError("Ultralytics BaseDataset not found under camtl_yolo.external.ultralytics") from e
 
-LOGGER = logging.getLogger(__name__)
+import os
 
+from camtl_yolo.external.ultralytics.ultralytics.utils import LOGGER
 
 @dataclass(frozen=True)
 class SampleRec:
@@ -95,6 +98,38 @@ class MultiTaskJSONDataset(BaseDataset):
         self.root = Path(meta["root"]).expanduser().resolve()
         self.split = split
         self.splits_json = Path(splits_json) if splits_json else (self.root / "splits.json")
+        if os.path.exists(self.splits_json):
+            self.splits_json = self.splits_json.resolve()
+        if not self.splits_json.exists():
+            from camtl_yolo.data import holdout
+            LOGGER.warning(f" 'splits.json' not found under {self.splits_json}")
+            LOGGER.warning("Generating splits.json with default 70/30 train/val fractions for all tasks.")
+            json_path = self.splits_json
+            LOGGER.warning(f"Writing splits JSON to: {json_path}")
+            splits = holdout.build_all(
+                config={
+                    'output_dir': self.root,
+                    'holdout': {
+                        'retinography_segmentation': {
+                            'train': 0.7,
+                            'val': 0.3,
+                            'test': 0.0
+                        },
+                        'angiography_segmentation': {
+                            'train': 0.7,
+                            'val': 0.3,
+                            'test': 0.0
+                        },
+                        'angiography_detection': {
+                            'train': 0.7,
+                            'val': 0.3,
+                            'test': 0.0
+                        }
+                    }
+                    }, 
+                seed=42)
+            json_path = self.splits_json
+            json_path.write_text(json.dumps(splits, indent=2), encoding="utf-8")
         self.include_keys = list(tasks) if tasks else list(self.JSON_KEYS)
         self.filter_is = filter_is
         self._records: List[SampleRec] = []
@@ -209,29 +244,41 @@ class MultiTaskJSONDataset(BaseDataset):
                 if bboxes.size:
                     bboxes[:, 1] = 1.0 - bboxes[:, 1]
 
-            # Normalize channel layout to contiguous RGB without negative strides
-            if img_bgr.ndim == 2:  # grayscale → BGR
+            # Normalize channel layout to contiguous RGB
+            if img_bgr.ndim == 2:
                 img_bgr = cv2.cvtColor(img_bgr, cv2.COLOR_GRAY2BGR)
-            elif img_bgr.shape[2] == 4:  # BGRA → BGR
+            elif img_bgr.shape[2] == 4:
                 img_bgr = cv2.cvtColor(img_bgr, cv2.COLOR_BGRA2BGR)
-            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)  # contiguous by construction
-            LOGGER.info(
-                f"Image {label.get('im_file', '')}: shape={img_rgb.shape}, "
-                f"bboxes={bboxes.shape if bboxes is not None else None}, "
-                f"mask={mask.shape if mask is not None else None}"
-            )
-            chw = np.ascontiguousarray(img_rgb.transpose(2, 0, 1))  # ensure positive strides
+            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+            chw = np.ascontiguousarray(img_rgb.transpose(2,0,1))
             img = torch.from_numpy(chw).float() / 255.0
+
             out: Dict[str, Any] = {
                 "img": img,
-                "cls": torch.from_numpy(cls).long() if cls.size else torch.zeros((0, 1), dtype=torch.long),
-                "bboxes": torch.from_numpy(bboxes).float() if bboxes.size else torch.zeros((0, 4), dtype=torch.float32),
+                "cls": torch.from_numpy(cls).long() if cls.size else torch.zeros((0,1), dtype=torch.long),
+                "bboxes": torch.from_numpy(bboxes).float() if bboxes.size else torch.zeros((0,4), dtype=torch.float32),
                 "is_seg": bool(label.get("is_seg", False)),
-                "domain": str(label.get("domain", "")),
-                "bn_domain": str(label.get("bn_domain", _map_bn_domain(label.get("domain", "")))),  # propagate
-                "path": str(label.get("im_file", "")),
+                "domain": str(label.get("domain","")),
+                "bn_domain": str(label.get("bn_domain", _map_bn_domain(label.get("domain","")))),
+                "path": str(label.get("im_file","")),
             }
-            out["mask"] = torch.from_numpy(mask).float() if mask is not None else torch.zeros((1, H, W), dtype=torch.float32)
+
+            if mask is None:
+                out["mask"]   = torch.zeros((1, H, W), dtype=torch.float32)
+                out["mask_p3"]= torch.zeros((1, H//8,  W//8 ), dtype=torch.float32)
+                out["mask_p4"]= torch.zeros((1, H//16, W//16), dtype=torch.float32)
+                out["mask_p5"]= torch.zeros((1, H//32, W//32), dtype=torch.float32)
+            else:
+                out["mask"] = torch.from_numpy(mask).float()  # (1,H,W)
+                m2d = mask[0]  # (H,W) np.float32 in {0,1}
+                # NOTE: Hardcoded strides, please refactor if changed in model. I know, bad practice.
+                m3 = downsample_mask_prob(m2d, stride=8,  method="avgpool")   # (H/8, W/8) float
+                m4 = downsample_mask_prob(m2d, stride=16, method="avgpool")
+                m5 = downsample_mask_prob(m2d, stride=32, method="avgpool")
+                out["mask_p3"] = torch.from_numpy(m3[None, ...]).float()
+                out["mask_p4"] = torch.from_numpy(m4[None, ...]).float()
+                out["mask_p5"] = torch.from_numpy(m5[None, ...]).float()
+
             return out
 
         return _transform
@@ -243,24 +290,26 @@ def multitask_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     domains = [b["domain"] for b in batch]
     bn_domains = [b.get("bn_domain", _map_bn_domain(b["domain"])) for b in batch]
     paths = [b["path"] for b in batch]
-    masks = torch.stack([b["mask"] for b in batch], 0)
+    masks    = torch.stack([b["mask"]    for b in batch], 0)
+    masks_p3 = torch.stack([b["mask_p3"] for b in batch], 0)
+    masks_p4 = torch.stack([b["mask_p4"] for b in batch], 0)
+    masks_p5 = torch.stack([b["mask_p5"] for b in batch], 0)
 
     all_boxes, all_cls, all_bi = [], [], []
     for i, b in enumerate(batch):
         if b["bboxes"].numel():
             n = b["bboxes"].shape[0]
-            all_boxes.append(b["bboxes"])
-            all_cls.append(b["cls"])
+            all_boxes.append(b["bboxes"]); all_cls.append(b["cls"])
             all_bi.append(torch.full((n,), i, dtype=torch.long))
-    bboxes = torch.cat(all_boxes, 0) if all_boxes else torch.zeros((0, 4), dtype=torch.float32)
-    cls = torch.cat(all_cls, 0) if all_cls else torch.zeros((0, 1), dtype=torch.long)
+    bboxes = torch.cat(all_boxes, 0) if all_boxes else torch.zeros((0,4), dtype=torch.float32)
+    cls = torch.cat(all_cls, 0) if all_cls else torch.zeros((0,1), dtype=torch.long)
     batch_idx = torch.cat(all_bi, 0) if all_bi else torch.zeros((0,), dtype=torch.long)
 
     return {
-        "img": imgs, "is_seg": is_seg, "domain": domains, "bn_domain": bn_domains, "mask": masks,
-        "bboxes": bboxes, "cls": cls, "batch_idx": batch_idx, "paths": paths,
+        "img": imgs, "is_seg": is_seg, "domain": domains, "bn_domain": bn_domains, "paths": paths,
+        "mask": masks, "mask_p3": masks_p3, "mask_p4": masks_p4, "mask_p5": masks_p5,
+        "bboxes": bboxes, "cls": cls, "batch_idx": batch_idx,
     }
-
 
 def build_dataloader(dataset: MultiTaskJSONDataset, batch_size: int, workers: int = 8,
                      shuffle: bool = True, drop_last: bool = False) -> DataLoader:

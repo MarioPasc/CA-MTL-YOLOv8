@@ -14,8 +14,13 @@ from camtl_yolo.external.ultralytics.ultralytics.utils.ops import make_divisible
 from camtl_yolo.external.ultralytics.ultralytics.utils import LOGGER
 
 # Cross-Attention Multi-Task Learning modules
-from camtl_yolo.model.nn import CSAM, CTAM, FPMA, SegHead
-from camtl_yolo.model.losses import DetectionLoss, MultiScaleBCEDiceLoss, ConsistencyMaskFromBoxes, AttentionAlignmentLoss
+from camtl_yolo.model.nn import CSAM, CTAM, FPMA, SegHeadMulti
+from camtl_yolo.model.losses import (
+    DetectionLoss, 
+    DeepSupervisionBCEDiceLoss, 
+    ConsistencyMaskFromBoxes, 
+    AttentionAlignmentLoss
+    )
 from camtl_yolo.model.utils.normalization import replace_seg_stream_bn_with_groupnorm
 from camtl_yolo.model.utils.debug_cycles import assert_no_module_cycles
 
@@ -142,24 +147,38 @@ class CAMTL_YOLO(DetectionModel):
 
     def _forward_once(self, x):
         """
-        Forward pass. Returns (det_out, seg_out) from the actual head modules,
-        not from cached y indices.
+        Forward pass that returns a tuple (det_out, seg_out).
+        Passes the original input HxW to SegHeadMulti so it can emit a fused full-res logits.
+        Works with standard Ultralytics caching: each module sees x built from y[m.f].
         """
         y = []
         det_out, seg_out = None, None
+        input_hw = x.shape[-2:] if torch.is_tensor(x) else None  # (H,W)
 
-        for m in self.model:
+        for i, m in enumerate(self.model):
+            # build module input(s) from cache
             if m.f != -1:
                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]
-            x = m(x)
-            # capture head outputs directly and keep normal caching
+
+            # run
+            if isinstance(m, SegHeadMulti):
+                seg_out = m(x, input_hw=input_hw)  # x is a List[P3,P4,P5]
+                out = seg_out                      # keep sequential semantics (cached below if needed)
+            else:
+                out = m(x)
+
+            # capture detect output explicitly
             if isinstance(m, Detect):
-                det_out = x
-            elif isinstance(m, SegHead):
-                seg_out = x
-            y.append(x if m.i in self.save else None)
+                det_out = out
+
+            # cache for future layers if this index is saved
+            y.append(out if m.i in self.save else None)
+
+            # carry forward last tensor for layers that take previous output
+            x = out
 
         return det_out, seg_out
+
 
     def init_criterion(self):
         """
@@ -186,12 +205,10 @@ class CAMTL_YOLO(DetectionModel):
         self.detect_criterion = DetectionLoss(self, hyp=det_hyp)
 
         # Segmentation loss: BCE+Dice at one or more scales
-        seg_scales = cfg.get("seg_scale_weights")
-        self.segment_criterion = MultiScaleBCEDiceLoss(
-            bce_weight=float(cfg.get("seg_bce", 1.0)),
-            dice_weight=float(cfg.get("seg_dice", 1.0)),
-            scale_weights=seg_scales,
-            from_logits=bool(cfg.get("seg_from_logits", True)),
+        self.segment_criterion = DeepSupervisionBCEDiceLoss(
+            w_p3=float(cfg.get("w_p3", 1.0)),
+            w_p4=float(cfg.get("w_p4", 1.0)),
+            w_p5=float(cfg.get("w_p5", 1.0)),
         )
 
         # Consistency: boxes → pseudo-mask on detection-domain images
