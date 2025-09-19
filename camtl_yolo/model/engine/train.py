@@ -48,6 +48,13 @@ class CAMTLTrainer(BaseTrainer):
     def __init__(self, cfg=DEFAULT_CFG, overrides: dict | None = None, _callbacks=None):
         overrides = overrides or {}
         super().__init__(cfg, overrides, _callbacks)
+        # One-time ratio logging and epoch loss tracking
+        self._ratio_logged: bool = False
+        self._prev_epoch_losses: List[float] | None = None
+        # Register lightweight callbacks
+        self.add_callback("on_train_start", self._log_ratio_once)
+        self.add_callback("on_train_epoch_end", self._capture_epoch_losses)
+        self.add_callback("on_fit_epoch_end", self._clear_cuda_cache)
 
     def _setup_train(self, world_size):
         """Copy of BaseTrainer._setup_train with a SafeModelEMA swap."""
@@ -328,8 +335,44 @@ class CAMTLTrainer(BaseTrainer):
     # ------------------------ Progress String ------------------------ #
 
     def progress_string(self):
-        s = super().progress_string()
-        if hasattr(self.train_loader, "ratio"):
+        # Show previous-epoch averaged losses under the progress bar
+        # (BaseTrainer prints this string once per epoch before TQDM)
+        if self._prev_epoch_losses and len(self._prev_epoch_losses) == len(self.loss_names):
+            parts = [
+                f"{name}={val:.4f}" for name, val in zip(self.loss_names, self._prev_epoch_losses)
+            ]
+            return "losses(prev): " + ", ".join(parts)
+        return "losses(prev): n/a"
+
+    # ------------------------ Callbacks (logging + memory) ------------------------ #
+
+    def _log_ratio_once(self, trainer: BaseTrainer):
+        """Log det:seg ratio exactly once at the start of training."""
+        if getattr(self, "_ratio_logged", False):
+            return
+        ratio_str = None
+        if hasattr(self, "train_loader") and hasattr(self.train_loader, "ratio"):
             rx, ry = getattr(self.train_loader, "ratio", (1, 1))
-            s += f"  [det:seg={rx}:{ry}]"
-        return s
+            ratio_str = f"[det:seg={rx}:{ry}]"
+        if ratio_str:
+            LOGGER.info(f"Training mix ratio {ratio_str}")
+        self._ratio_logged = True
+
+    def _capture_epoch_losses(self, trainer: BaseTrainer):
+        """Capture averaged losses at the end of each epoch for display next epoch."""
+        tl = getattr(trainer, "tloss", None)
+        if isinstance(tl, torch.Tensor):
+            try:
+                self._prev_epoch_losses = [float(x) for x in tl.detach().cpu().tolist()]
+            except Exception:
+                self._prev_epoch_losses = None
+        else:
+            self._prev_epoch_losses = None
+
+    def _clear_cuda_cache(self, trainer: BaseTrainer):
+        """Clear CUDA cache between epochs to mitigate fragmentation/OOM."""
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass

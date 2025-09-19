@@ -1,0 +1,18 @@
+# Data root directory, we are expecting three datasets here:
+#  root
+#   ├── angiography
+#   │   ├── detect
+#   │   │   ├── images
+#   │   │   └── labels
+#   │   └── segment
+#   │   │   ├── images
+#   │   │   └── labels
+#   ├── retinography
+#   │    ├── images
+#   │    └── labels
+#   └── splits.json
+# This structure was created using the preprocessing module, but we are releasing a version of the 
+# datasets already preprocessed and ready to use using this Google Drive link:
+# https://drive.google.com/drive/folders/10qBYj3A_OTis2zUm55f5S0pZwHTyBeaa?usp=sharing 
+
+root: /mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/camtl_yolo
