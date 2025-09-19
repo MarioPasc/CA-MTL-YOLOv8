@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from pathlib import Path
 import yaml # type: ignore
+import weakref
 
 # Ultralytics modules
 from camtl_yolo.external.ultralytics.ultralytics.nn.modules import (
@@ -15,13 +16,22 @@ from camtl_yolo.external.ultralytics.ultralytics.utils import LOGGER
 # Cross-Attention Multi-Task Learning modules
 from camtl_yolo.model.nn import CSAM, CTAM, FPMA, SegHead
 from camtl_yolo.model.losses import DetectionLoss, MultiScaleBCEDiceLoss, ConsistencyMaskFromBoxes, AttentionAlignmentLoss
-from camtl_yolo.model.utils.normalization import replace_seg_stream_bn_with_groupnorm, assert_no_module_cycles
+from camtl_yolo.model.utils.normalization import replace_seg_stream_bn_with_groupnorm
+from camtl_yolo.model.utils.debug_cycles import assert_no_module_cycles
 
 def _find_idx(modules, cls):
     for i, m in enumerate(modules):
         if isinstance(m, cls):
             return i
     return None
+
+def _dump_children(mod: nn.Module, max_depth: int = 3, prefix: str = "root", depth: int = 0):
+    if depth > max_depth:
+        return
+    for k, v in mod._modules.items():
+        print(f"{prefix}.{k}: {v.__class__.__name__}")
+        _dump_children(v, max_depth=max_depth, prefix=f"{prefix}.{k}", depth=depth+1)
+
 
 class CAMTL_YOLO(DetectionModel):
     """
@@ -191,6 +201,7 @@ class CAMTL_YOLO(DetectionModel):
         )
 
         # Attention alignment
+        # IMPORTANT: pass a weak proxy to avoid creating a Module cycle (child→parent back-reference).
         self.align_criterion = AttentionAlignmentLoss(
             model=self,
             source_name=str(cfg.get("source_domain", "retinography")),
@@ -203,6 +214,14 @@ class CAMTL_YOLO(DetectionModel):
         self._lambda_seg = float(cfg.get("lambda_seg", 1.0))
         self._lambda_cons = float(cfg.get("lambda_cons", 0.1))
         self._lambda_align = float(cfg.get("lambda_align", 0.1))
+
+        _dump_children(self, max_depth=2)
+        # Fail fast if any other accidental cycles exist
+        try:
+            assert_no_module_cycles(self)
+        except Exception as e:
+            # Turn into a hard error in dev; WARN if you prefer soft behavior
+            raise RuntimeError(f"Module cycle detected after criterion init: {e}")
         return True
 
     def loss(self, batch, preds):
@@ -668,5 +687,4 @@ class CAMTL_YOLO(DetectionModel):
             ch.append(c2)
 
         return nn.Sequential(*layers), sorted(set(save))
-
 

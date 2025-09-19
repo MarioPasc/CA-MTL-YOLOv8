@@ -19,7 +19,6 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Tuple
 
-
 def _parse_key_value(s: str) -> Tuple[str, Any]:
     """Parse a key=value string and convert the value to a sensible type.
 
