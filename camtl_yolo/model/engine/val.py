@@ -10,7 +10,7 @@ import yaml # type: ignore
 import contextlib
 
 import numpy as np
-import pandas as pd # type: ignore
+import os
 
 import torch
 import torch.nn as nn
@@ -18,6 +18,7 @@ import torch.nn.functional as F
 
 from camtl_yolo.model.utils.normalization import set_bn_domain
 from camtl_yolo.model.utils.samplers import map_domain_name
+from camtl_yolo.model.utils.plotting import make_final_camtl_viz
 from camtl_yolo.external.ultralytics.ultralytics.engine.validator import BaseValidator
 from camtl_yolo.external.ultralytics.ultralytics.utils import LOGGER, TQDM
 from camtl_yolo.external.ultralytics.ultralytics.utils.ops import Profile
@@ -37,7 +38,6 @@ class CAMTLValidator(BaseValidator):
     # ---------------------- Construction ---------------------- #
     def __init__(self, dataloader=None, save_dir=None, args=None, _callbacks=None) -> None:
         super().__init__(dataloader, save_dir, args, _callbacks)
-        self.args.task = "detect+segment"
         self.metrics = SimpleNamespace(
             keys=[
                 "val/det",
@@ -304,6 +304,7 @@ class CAMTLValidator(BaseValidator):
         """
         # Training vs standalone
         self.training = trainer is not None
+        self.args.task = trainer.model.task
         augment = False  # no aug at val
 
         if self.training:
@@ -371,6 +372,10 @@ class CAMTLValidator(BaseValidator):
         self.init_metrics(unwrap_model(fwd_model))
         self.jdict = []  # reserved for future JSON exports
 
+        # Collect a small set of images and per-image seg outputs to render a final panel at the end
+        viz_imgs: list[torch.Tensor] = []
+        viz_segs: list[dict] = []
+
         # Iterate
         for batch_i, batch in enumerate(bar):
             self.run_callbacks("on_val_batch_start")
@@ -383,6 +388,41 @@ class CAMTLValidator(BaseValidator):
             # Inference
             with dt[1]:
                 preds = fwd_model(batch["img"], augment=augment)
+
+            # Collect up to 16 images and their segmentation outputs for a final visualization panel
+            try:
+                if len(viz_imgs) < 16:
+                    imgs = batch.get("img")  # [B, C, H, W]
+                    if torch.is_tensor(imgs) and imgs.ndim == 4:
+                        take = int(min(imgs.size(0), 16 - len(viz_imgs)))
+                        # Extract segmentation predictions from model output
+                        seg_out = self._extract_seg_predictions(preds)
+                        for i in range(take):
+                            viz_imgs.append(imgs[i].detach().cpu())
+                            # Build a dict with expected keys; handle dict or tensor outputs
+                            if isinstance(seg_out, dict):
+                                seg_dict = {
+                                    "full": seg_out.get("full"),
+                                    "p3": seg_out.get("p3"),
+                                    "p4": seg_out.get("p4"),
+                                    "p5": seg_out.get("p5"),
+                                }
+                            else:
+                                # Single tensor -> treat as full-resolution logits
+                                seg_dict = {"full": seg_out, "p3": None, "p4": None, "p5": None}
+                            # Index per-image if batched tensors are present
+                            for k, v in list(seg_dict.items()):
+                                if torch.is_tensor(v):
+                                    if v.ndim == 4:  # [B,1,h,w]
+                                        seg_dict[k] = v[i].detach().cpu()
+                                    else:
+                                        seg_dict[k] = v.detach().cpu()
+                                else:
+                                    seg_dict[k] = v
+                            viz_segs.append(seg_dict)
+            except Exception:
+                # Best-effort; do not interrupt validation on visualization issues
+                pass
 
             # Loss accumulation vector for BaseTrainer CSV/print (training only)
             with dt[2]:
@@ -416,6 +456,26 @@ class CAMTLValidator(BaseValidator):
         self.finalize_metrics()
         self.print_results()
         self.run_callbacks("on_val_end")
+
+        # Save the final visualization panel if we collected any samples
+        try:
+            if viz_imgs:
+                imgs_b = torch.stack(viz_imgs, dim=0)  # [N, C, H, W]
+                # Map generic task name if needed; default to DomainShift1 layout
+                task = getattr(self.args, "task", "DomainShift1")
+                num = 0
+                out_file = Path(self.save_dir) / f"val_{str(task).lower()}_{num}.png"
+                if os.path.exists(out_file) and os.path.isfile(out_file):
+                    # Get the last digit in the filename
+                    num = int(out_file.stem.split("_")[-1]) + 1
+                    out_file = Path(self.save_dir) / f"val_{str(task).lower()}_{num}.png"
+                make_final_camtl_viz(task=str(task), imgs=imgs_b, seg_outputs=viz_segs,
+                                     out_path=out_file, max_images=16, rows=4)
+        except Exception as e:
+            try:
+                LOGGER.warning(f"[final_viz] skipped: {e}")
+            except Exception:
+                pass
 
         self._remove_fm_hooks()
         # Return dict consistent with BaseValidator

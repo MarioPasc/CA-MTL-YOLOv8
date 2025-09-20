@@ -13,16 +13,25 @@ You can tweak COLORS, LINESTYLES, and other STYLE_* constants below.
 
 from __future__ import annotations
 
+from camtl_yolo.external.ultralytics.ultralytics.utils import LOGGER
+
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Union, Any, Iterable
 import logging
 import csv
-
 import matplotlib.pyplot as plt
 import numpy as np
 import cv2
 import matplotlib
 matplotlib.use("Agg") 
+
+try:
+    import torch
+    import torch.nn.functional as F
+except Exception as e:  # pragma: no cover
+    raise RuntimeError("final_viz requires PyTorch installed") from e
+
+
 
 # =========================
 # Style configuration block
@@ -536,3 +545,159 @@ def save_aug_debug_grid(
     plt.close(fig)
     return out_path
 
+
+def _to_hwc_uint8(img_chw: torch.Tensor) -> np.ndarray:
+    """Convert CHW float [0,1] or uint8 to HWC uint8 BGR."""
+    if img_chw.ndim != 3:
+        raise ValueError(f"expected CHW image, got {tuple(img_chw.shape)}")
+    x = img_chw.detach()
+    if x.dtype.is_floating_point:
+        x = x.clamp(0, 1) * 255.0
+    x = x.to(torch.uint8).cpu().numpy()            # CHW
+    x = np.transpose(x, (1, 2, 0))                 # HWC
+    if x.shape[2] == 1:
+        x = np.repeat(x, 3, axis=2)
+    return x[:, :, ::-1]                           # RGB->BGR for cv2 interop, pyplot will flip back
+
+
+def _sigmoid2d(t: torch.Tensor) -> np.ndarray:
+    """Return 2D numpy array in [0,1] from logits/probs of shapes [1,h,w] or [h,w]."""
+    a = t.detach().float()
+    if a.ndim == 3 and a.shape[0] == 1:
+        a = a.squeeze(0)
+    if a.ndim == 3:
+        a = a[0]
+    a = torch.sigmoid(a)
+    return a.cpu().numpy()
+
+
+def _resize_mask(m: Optional[np.ndarray], W: int, H: int) -> Optional[np.ndarray]:
+    """Nearest-neighbor resize to (W,H)."""
+    if m is None:
+        return None
+    return cv2.resize(m, (W, H), interpolation=cv2.INTER_NEAREST)
+
+
+def _extract_single_seg_for_index(
+    seg_outputs: Union[Dict[str, torch.Tensor], List[Dict[str, torch.Tensor]]],
+    idx: int
+) -> Dict[str, Optional[np.ndarray]]:
+    """
+    From batched seg dicts with tensors [B,1,h,w] or [1,h,w], take image idx and return
+    numpy 2D arrays in [0,1] for keys {'full','p3','p4','p5'} when present.
+    """
+    if isinstance(seg_outputs, list):
+        # list per-image dictionaries already
+        sd = seg_outputs[idx]
+    else:
+        sd = seg_outputs
+
+    out: Dict[str, Optional[np.ndarray]] = {"full": None, "p3": None, "p4": None, "p5": None}
+    for k in out.keys():
+        t = sd.get(k)
+        if t is None or not torch.is_tensor(t):
+            out[k] = None
+            continue
+        tt = t
+        if tt.ndim == 4:
+            tt = tt[idx]  # [B,1,h,w] -> [1,h,w]
+        out[k] = _sigmoid2d(tt)
+    return out
+
+
+def make_final_camtl_viz(
+    task: str,
+    imgs: torch.Tensor,
+    seg_outputs: Union[Dict[str, torch.Tensor], List[Dict[str, torch.Tensor]]],
+    out_path: Union[str, Path],
+    max_images: int = 16,
+    rows: int = 4
+) -> Path:
+    """
+    Render final visualization for CAMTL project.
+
+    Parameters
+    ----------
+    task : str
+        "DomainShift1" renders a grid with columns [img+full] | [P3] | [P4] | [P5].
+        "CAMTL" writes a black canvas placeholder.
+    imgs : torch.Tensor
+        Batch of images [B,C,H,W], values in [0,1] recommended.
+    seg_outputs : dict or list of dict
+        Segmentation outputs holding tensors per scale. Expected keys: 'full','p3','p4','p5'.
+    out_path : str or Path
+        Output file path (PNG).
+    max_images : int
+        Max number of images to render (default 16).
+    rows : int
+        Number of rows in the grid (default 4). Columns are fixed to 4.
+
+    Returns
+    -------
+    Path
+        Saved figure path.
+    """
+    out_p = Path(out_path)
+    out_p.parent.mkdir(parents=True, exist_ok=True)
+
+    if task == "CAMTL":
+        # Placeholder black canvas 1024x1024
+        fig = plt.figure(figsize=(8, 8), facecolor="black")
+        ax = fig.add_subplot(1, 1, 1)
+        ax.set_facecolor("black")
+        ax.set_axis_off()
+        fig.savefig(out_p, dpi=200, bbox_inches="tight", facecolor=fig.get_facecolor())
+        plt.close(fig)
+        return out_p
+
+    if task != "DomainShift1":
+        LOGGER.warning(f"Unknown task '{task}', defaulting to DomainShift1 layout.")
+
+    if imgs.ndim != 4:
+        raise ValueError(f"'imgs' must be [B,C,H,W], got {tuple(imgs.shape)}")
+    B, C, H, W = imgs.shape
+
+    n = min(B, max_images)
+    cols = 4
+    rows = min(rows, (n + cols - 1) // cols) if rows > 0 else (n + cols - 1) // cols
+
+    fig_w = 4 * 4  # 4 columns * 4 inches
+    fig_h = rows * 4
+    fig, axes = plt.subplots(rows, cols, figsize=(fig_w, fig_h), squeeze=False)
+    for ax in axes.ravel():
+        ax.axis("off")
+
+    # Titles only on first row
+    col_titles = ["img + full", "P3 (64×64)", "P4 (32×32)", "P5 (16×16)"]
+    for j in range(cols):
+        axes[0][j].set_title(col_titles[j])
+
+    for i in range(n):
+        r = i // cols
+        c0, c1, c2, c3 = axes[r]
+        img_bgr = _to_hwc_uint8(imgs[i])
+        seg = _extract_single_seg_for_index(seg_outputs, i)
+
+        # Panel 1: original + full overlay at 512x512 using mask after activation
+        base = cv2.resize(img_bgr, (W, H), interpolation=cv2.INTER_NEAREST)
+        c0.imshow(base[..., ::-1])  # display RGB
+
+        full_m = seg.get("full")
+        if full_m is not None:
+            full_up = _resize_mask(full_m, W, H)
+            # Transparent background, red overlay with fixed alpha=0.7
+            c0.imshow(full_up, cmap="Reds", alpha=0.7, interpolation="nearest")
+        c0.axis("off")
+
+        # Panels: P3, P4, P5 upsampled with nearest neighbor to (W,H)
+        for ax, key in zip((c1, c2, c3), ("p3", "p4", "p5")):
+            mk = seg.get(key)
+            if mk is not None:
+                mk_up = _resize_mask(mk, W, H)
+                ax.imshow(mk_up, interpolation="nearest", cmap="gray")
+            ax.axis("off")
+
+    fig.tight_layout()
+    fig.savefig(out_p, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return out_p
