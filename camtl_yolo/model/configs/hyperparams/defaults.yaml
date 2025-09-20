@@ -33,9 +33,9 @@ cls: 0.5 # (float) cls loss gain (scale with pixels)
 dfl: 1.5 # (float) dfl loss gain
 
 ## Enabled augmentation hyperparameters ##
-translate: 0.2 # (float) image translation (+/- fraction)
-scale: 0.2 # (float) image scale (+/- gain)
-fliplr: 0.2 # (float) image flip left-right (probability)
+translate: 0.9 # (float) image translation (+/- fraction)
+scale: 0.9 # (float) image scale (+/- gain)
+fliplr: 0.9 # (float) image flip left-right (probability)
 
 ## Disabled augmentation hyperparameters ##
 degrees: 0 # (float) image rotation (+/- deg)
