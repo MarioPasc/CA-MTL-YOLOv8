@@ -64,312 +64,6 @@ class CAMTLValidator(BaseValidator):
         self._logged_epoch_saves: set[int] = set()       # epochs already saved
         self._seg_cache: Dict[str, torch.Tensor] = {}    # latest seg outputs for current batch
 
-
-
-    # ---------------------- Hooks ---------------------- #
-    def _register_temp_fm_hooks(self, base_model: nn.Module) -> None:
-        """
-        Register short-lived hooks to capture Detect inputs and optional extra layers.
-        Hooks are removed right after a single forced forward.
-        """
-        if getattr(self, "_fm_hook_handles", None) is None:
-            self._fm_hook_handles = []
-
-        seq = getattr(base_model, "model", None)
-        if seq is None:
-            return
-
-        idx2mod: Dict[int, nn.Module] = {getattr(m, "i", i): m for i, m in enumerate(seq) if hasattr(m, "forward")}
-
-        # Detect PRE-hook → capture P3/P4/P5 features
-        detect_idx = None
-        for i in sorted(idx2mod):
-            if type(idx2mod[i]).__name__ == "Detect":
-                detect_idx = i
-                break
-
-        if detect_idx is not None:
-            det_mod = idx2mod[detect_idx]
-
-            def _detect_prehook(_m: nn.Module, _in: Any) -> None:
-                xs = _in[0] if isinstance(_in, (tuple, list)) else _in
-                if isinstance(xs, (list, tuple)):
-                    for si, t in enumerate(xs):
-                        if torch.is_tensor(t):
-                            key = detect_idx * 10 + si  # e.g., 280/281/282
-                            self._fm_last[key] = t.detach()
-
-            self._fm_hook_handles.append(det_mod.register_forward_pre_hook(_detect_prehook))
-
-        # Optional extra layer hooks (none by default)
-        for li in getattr(self, "_fm_layers", []):
-            mod = idx2mod.get(li)
-            if mod is None:
-                continue
-
-            def _f_hook(_m: nn.Module, _in: Any, out: Any, idx: int = li) -> None:
-                if isinstance(out, (list, tuple)):
-                    out = out[0]
-                if torch.is_tensor(out):
-                    self._fm_last[idx] = out.detach()
-
-            self._fm_hook_handles.append(mod.register_forward_hook(_f_hook))
-
-    def _capture_once_and_save(
-        self,
-        base_model: nn.Module,
-        batch: Dict[str, Any],
-        fm_dir: "Path",
-        seg_dir: "Path",
-        det_dir: "Path",
-        is_seg_batch: bool,
-        det_preds: Any,
-    ) -> None:
-        """
-        Register hooks, run one forward to populate FM and seg logits, then remove hooks and save.
-        Ensures no hooks remain on the model after saving (pickle-safe).
-
-        Mixed-precision safe: inputs are cast to the model's parameter dtype.
-        """
-        from pathlib import Path
-        from camtl_yolo.external.ultralytics.ultralytics.utils import LOGGER
-
-        imgs = batch.get("img", None)
-        if imgs is None or not torch.is_tensor(imgs):
-            return
-
-        # Reset caches
-        self._fm_last.clear()
-        self._seg_cache = {}
-
-        # Temp hooks
-        self._register_temp_fm_hooks(base_model)
-
-        try:
-            base_model.eval()
-
-            # Cast inputs to match model parameter dtype to avoid half/float mismatch
-            try:
-                p = next(base_model.parameters())
-                param_dtype = p.dtype
-            except StopIteration:
-                param_dtype = imgs.dtype
-            imgs_cast = imgs.to(self.device, dtype=param_dtype, non_blocking=True)
-
-            # Autocast only on CUDA; keep disabled otherwise
-            use_cuda = (self.device.type == "cuda")
-            use_amp = use_cuda and (param_dtype in (torch.float16, torch.bfloat16))
-            autocast_ctx = torch.cuda.amp.autocast(enabled=use_amp) if use_cuda else contextlib.nullcontext()
-
-            with torch.no_grad(), autocast_ctx:
-                out = base_model(imgs_cast)
-
-            # Cache seg logits for panel if this is a segmentation batch
-            seg_out = self._extract_seg_predictions(out)
-            if isinstance(seg_out, dict):
-                self._seg_cache = {k: v.detach() for k, v in seg_out.items() if torch.is_tensor(v)}
-            elif torch.is_tensor(seg_out):
-                self._seg_cache = {"full": seg_out.detach()}
-        except Exception as e:
-            LOGGER.warning(f"[CAMTLValidator] forced forward for FM/seg capture failed: {e}")
-        finally:
-            # Critical: remove hooks before any save() that might pickle the model
-            self._remove_fm_hooks()
-
-        # Save FM tensors (first image only)
-        _ = self._save_feature_maps(Path(fm_dir), batch) if self._fm_last else 0
-
-        # Save predictions
-        if is_seg_batch and self._seg_cache:
-            # Build the requested 1x4 panel
-            img0 = batch["img"][0] if batch["img"].ndim == 4 else batch["img"]  # CHW
-            panel_path = Path(seg_dir) / "panel_seg.png"
-            self._save_camtl_panel(panel_path, img0, self._seg_cache)
-        elif (not is_seg_batch) and isinstance(det_preds, (list, tuple)):
-            _ = self._save_detect_preds(Path(det_dir), batch, det_preds)
-
-
-    def _save_camtl_panel(self, out_path: Path, img_chw: torch.Tensor, seg_dict: Dict[str, torch.Tensor]) -> None:
-        """
-        Save a 1x4 panel: [original+full] | [p3] | [p4] | [p5] at native sizes.
-        No upsampling. Uses nearest rendering to preserve pixel scale.
-        Handles 4D tensors by selecting the first image in the batch.
-        """
-        import matplotlib.pyplot as plt
-        import numpy as np
-
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Ensure image is CHW
-        if img_chw.ndim == 4:
-            img_chw = img_chw[0]
-        if img_chw.ndim != 3:
-            raise ValueError(f"_save_camtl_panel expected CHW image, got shape={tuple(img_chw.shape)}")
-
-        # Prepare base image (C,H,W) -> BGR HxWxC
-        x = img_chw.detach().float().clamp(0, 1).cpu().numpy()  # CHW
-        x = (x * 255.0).round().astype(np.uint8)
-        x = np.transpose(x, (1, 2, 0))
-        if x.shape[2] == 1:
-            x = np.repeat(x, 3, axis=2)
-        img_bgr = x[:, :, ::-1]
-
-        # Single-image per-scale tensors
-        single_seg: Dict[str, torch.Tensor] = {}
-        for k in ("p3", "p4", "p5", "full"):
-            t = seg_dict.get(k, None)
-            if torch.is_tensor(t):
-                if t.ndim == 4:
-                    t = t[0]
-                single_seg[k] = t
-
-        def _as_2d(m: torch.Tensor) -> np.ndarray:
-            a = m.detach().float().cpu()
-            if a.ndim == 3 and a.shape[0] == 1:
-                a = a.squeeze(0)
-            if a.ndim == 3:
-                a = a[0]
-            return torch.sigmoid(a).numpy()
-
-        p3 = single_seg.get("p3", None)
-        p4 = single_seg.get("p4", None)
-        p5 = single_seg.get("p5", None)
-        full = single_seg.get("full", None)
-
-        fig, axs = plt.subplots(1, 4, figsize=(12, 3), squeeze=True)
-
-        # Panel 1: original + full overlay if available (no resize)
-        axs[0].imshow(img_bgr[..., ::-1])  # display RGB
-        axs[0].set_title("img + full")
-        if isinstance(full, torch.Tensor):
-            mf = _as_2d(full)
-            axs[0].imshow(mf, alpha=0.35, interpolation="nearest")
-        axs[0].axis("off")
-
-        # Panels 2-4: P3/P4/P5 at native sizes, no interpolation to 512
-        for j, (title, tt) in enumerate([("P3", p3), ("P4", p4), ("P5", p5)], start=1):
-            axs[j].set_title(title)
-            if isinstance(tt, torch.Tensor):
-                mj = _as_2d(tt)
-                axs[j].imshow(mj, interpolation="nearest")
-            axs[j].axis("off")
-
-        fig.tight_layout()
-        fig.savefig(out_path, dpi=200, bbox_inches="tight")
-        plt.close(fig)
-
-
-
-    def _save_feature_maps(self, fm_dir: Path, batch: Dict[str, Any]) -> int:
-        from pathlib import Path
-        fm_dir = Path(fm_dir)
-        fm_dir.mkdir(parents=True, exist_ok=True)
-        img_tensor = batch.get("img", torch.empty(0))
-        B = int(getattr(img_tensor, "shape", [0])[0]) if hasattr(img_tensor, "shape") else 0
-        im_files = batch.get("im_file", [str(i) for i in range(B)])
-        n_saved = 0
-        for li, t in sorted(self._fm_last.items()):
-            if not torch.is_tensor(t) or t.ndim < 3:
-                continue
-            bsz = t.shape[0]
-            for bi in range(min(B, bsz, 1)):  # one image is enough
-                stem = Path(im_files[bi]).stem if isinstance(im_files, (list, tuple)) and len(im_files) > bi else str(bi)
-                out_path = fm_dir / f"{stem}_{li}.pt"
-                torch.save({"layer_index": int(li), "shape": tuple(t[bi].shape), "tensor": t[bi].cpu()}, out_path)
-                n_saved += 1
-        return n_saved
-
-    def _img_tensor_to_bgr(self, t: torch.Tensor) -> np.ndarray:
-        import numpy as np
-        if t.ndim != 3:
-            raise ValueError(f"expected CHW, got shape={tuple(t.shape)}")
-        x = t.detach().float().clamp(0, 1).cpu().numpy()       # CHW, 0..1
-        x = (x * 255.0).round().astype(np.uint8)               # CHW, 0..255
-        x = np.transpose(x, (1, 2, 0))                         # HWC
-        if x.shape[2] == 1:
-            x = np.repeat(x, 3, axis=2)
-        return x[:, :, ::-1]                                   # RGB->BGR
-
-    def _draw_dets(self, img_bgr: np.ndarray, boxes_xyxy: np.ndarray,
-                cls: np.ndarray, conf: np.ndarray) -> np.ndarray:
-        import cv2
-        out = img_bgr.copy()
-        n = boxes_xyxy.shape[0]
-        for i in range(n):
-            x1, y1, x2, y2 = boxes_xyxy[i].astype(int).tolist()
-            label = f"{int(cls[i])}:{float(conf[i]):.2f}"
-            cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 0), 2, lineType=cv2.LINE_AA)
-            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
-            y1t = max(y1, th + 3)
-            cv2.rectangle(out, (x1, y1t - th - 4), (x1 + tw + 4, y1t), (0, 255, 0), -1)
-            cv2.putText(out, label, (x1 + 2, y1t - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1, cv2.LINE_AA)
-        return out
-
-    def _save_detect_preds(self, det_dir: "Path", batch: Dict[str, Any], det_preds: Any) -> int:
-        from pathlib import Path
-        import numpy as np
-        import cv2
-        det_dir = Path(det_dir)
-        det_dir.mkdir(parents=True, exist_ok=True)
-        img_tensor = batch.get("img", torch.empty(0))
-        B = int(getattr(img_tensor, "shape", [0])[0]) if hasattr(img_tensor, "shape") else 0
-        im_files = batch.get("im_file", [str(i) for i in range(B)])
-        n_overlays = 0
-        if not isinstance(det_preds, (list, tuple)):
-            return 0
-        for bi in range(min(B, len(det_preds), 1)):  # save first image of the batch
-            stem = Path(im_files[bi]).stem if len(im_files) > bi else str(bi)
-            try:
-                img_bgr = self._img_tensor_to_bgr(img_tensor[bi])
-                p = det_preds[bi] if isinstance(det_preds[bi], dict) else {}
-                boxes = np.asarray(p.get("bboxes", torch.zeros((0, 4))).detach().cpu().numpy())
-                conf = np.asarray(p.get("conf", torch.zeros((0,))).detach().cpu().numpy())
-                cls = np.asarray(p.get("cls", torch.zeros((0,))).detach().cpu().numpy())
-                overlay = self._draw_dets(img_bgr, boxes, cls, conf)
-                cv2.imwrite(str(det_dir / f"{stem}_pred.jpg"), overlay)
-                n_overlays += 1
-            except Exception as e:
-                from camtl_yolo.external.ultralytics.ultralytics.utils import LOGGER
-                LOGGER.debug(f"[CAMTLValidator] detect overlay save failed for {stem}: {e}")
-        return n_overlays
-
-    def _save_seg_preds(self, seg_dir: "Path", batch: Dict[str, Any]) -> int:
-        from pathlib import Path
-        import cv2
-        seg_dir = Path(seg_dir)
-        seg_dir.mkdir(parents=True, exist_ok=True)
-        if not self._seg_cache:
-            return 0
-        img_tensor = batch.get("img", torch.empty(0))
-        B = int(getattr(img_tensor, "shape", [0])[0]) if hasattr(img_tensor, "shape") else 0
-        im_files = batch.get("im_file", [str(i) for i in range(B)])
-        n_masks = 0
-        for bi in range(min(B, 1)):  # save first image only
-            stem = Path(im_files[bi]).stem if len(im_files) > bi else str(bi)
-            for sk, t in self._seg_cache.items():
-                try:
-                    m = t[bi]
-                    if m.ndim == 3 and m.shape[0] == 1:
-                        m = m.squeeze(0)
-                    m = torch.sigmoid(m).detach().cpu().numpy()
-                    if m.ndim == 3:
-                        m = m[0]
-                    m_img = (m * 255).astype("uint8")
-                    cv2.imwrite(str(seg_dir / f"{stem}_{sk}.png"), m_img)
-                    n_masks += 1
-                except Exception:
-                    pass
-        return n_masks
-
-    def _remove_fm_hooks(self) -> None:
-        """Remove any registered hooks to keep the model pickle-safe."""
-        for h in getattr(self, "_fm_hook_handles", []):
-            try:
-                h.remove()
-            except Exception:
-                pass
-        self._fm_hook_handles = []
-
     def preprocess(self, batch: Dict[str, Any]) -> Dict[str, Any]:
         """
         Move tensors to device, set precision, and switch DualBN branch by batch domain tag.
@@ -491,6 +185,48 @@ class CAMTLValidator(BaseValidator):
         )
 
         LOGGER.info(f"[CAMTLValidator] Saved validation assets for epoch {epoch_1based} to {base_dir}")
+        # Accumulate component losses for printing
+        base_model = getattr(self, "_current_model_for_loss", None)
+        if isinstance(base_model, nn.Module):
+            with torch.no_grad():
+                _, items = base_model.loss(batch, preds)  # same order as trainer.loss_names
+            # items: [det, seg, cons, align, l2sp, total, ...]
+            det_val = float(items[0])
+            seg_val = float(items[1])
+            cons_val = float(items[2])
+            align_val = float(items[3])
+            l2sp_val = float(items[4])
+            is_seg_batch = bool(torch.as_tensor(batch.get("is_seg", False)).any().item())
+            is_det_batch = bool(torch.as_tensor(batch.get("is_det", False)).any().item())
+            self._sum_det += det_val
+            self._sum_seg += seg_val
+            self._sum_cons += cons_val
+            self._sum_align += align_val
+            self._sum_l2sp += l2sp_val
+            self._cnt_det += int(is_det_batch)
+            self._cnt_seg += int(is_seg_batch)
+    # 3) Accumulate Dice per scale on seg batches
+        is_seg_batch = bool(torch.as_tensor(batch.get("is_seg", False)).any().item())
+        if is_seg_batch:
+            seg_preds = self._extract_seg_predictions(preds)
+            if isinstance(seg_preds, dict):
+                for k in ("p3", "p4", "p5"):
+                    if k in seg_preds:
+                        gt = batch.get(f"mask_{k}") 
+                        if gt is not None:
+                            d = self._dice(seg_preds[k], gt)
+                            self._dice_sums[k] += float(d)
+                            self._dice_counts[k] += 1
+                if "full" in seg_preds:
+                    gt_full = batch.get("mask")
+                    if gt_full is not None:
+                        d = self._dice(seg_preds["full"], gt_full)
+                        self._dice_sums["full"] += float(d)
+                        self._dice_counts["full"] += 1
+
+        # 4) Optional: only gating artifact-saving by rank/batch
+        if not self._is_main() or int(getattr(self, "batch_i", 0)) != 0:
+            return
         self._logged_epoch_saves.add(epoch_1based)
 
 
@@ -750,3 +486,306 @@ class CAMTLValidator(BaseValidator):
         q = max(total_epochs // self._save_fm_max, 1)
         return np.arange(q, total_epochs + q, step=q, dtype=int)
 
+
+
+    # ---------------------- Hooks ---------------------- #
+    def _register_temp_fm_hooks(self, base_model: nn.Module) -> None:
+        """
+        Register short-lived hooks to capture Detect inputs and optional extra layers.
+        Hooks are removed right after a single forced forward.
+        """
+        if getattr(self, "_fm_hook_handles", None) is None:
+            self._fm_hook_handles = []
+
+        seq = getattr(base_model, "model", None)
+        if seq is None:
+            return
+
+        idx2mod: Dict[int, nn.Module] = {getattr(m, "i", i): m for i, m in enumerate(seq) if hasattr(m, "forward")}
+
+        # Detect PRE-hook → capture P3/P4/P5 features
+        detect_idx = None
+        for i in sorted(idx2mod):
+            if type(idx2mod[i]).__name__ == "Detect":
+                detect_idx = i
+                break
+
+        if detect_idx is not None:
+            det_mod = idx2mod[detect_idx]
+
+            def _detect_prehook(_m: nn.Module, _in: Any) -> None:
+                xs = _in[0] if isinstance(_in, (tuple, list)) else _in
+                if isinstance(xs, (list, tuple)):
+                    for si, t in enumerate(xs):
+                        if torch.is_tensor(t):
+                            key = detect_idx * 10 + si  # e.g., 280/281/282
+                            self._fm_last[key] = t.detach()
+
+            self._fm_hook_handles.append(det_mod.register_forward_pre_hook(_detect_prehook))
+
+        # Optional extra layer hooks (none by default)
+        for li in getattr(self, "_fm_layers", []):
+            mod = idx2mod.get(li)
+            if mod is None:
+                continue
+
+            def _f_hook(_m: nn.Module, _in: Any, out: Any, idx: int = li) -> None:
+                if isinstance(out, (list, tuple)):
+                    out = out[0]
+                if torch.is_tensor(out):
+                    self._fm_last[idx] = out.detach()
+
+            self._fm_hook_handles.append(mod.register_forward_hook(_f_hook))
+
+    def _capture_once_and_save(
+        self,
+        base_model: nn.Module,
+        batch: Dict[str, Any],
+        fm_dir: "Path",
+        seg_dir: "Path",
+        det_dir: "Path",
+        is_seg_batch: bool,
+        det_preds: Any,
+    ) -> None:
+        """
+        Register hooks, run one forward to populate FM and seg logits, then remove hooks and save.
+        Ensures no hooks remain on the model after saving (pickle-safe).
+
+        Mixed-precision safe: inputs are cast to the model's parameter dtype.
+        """
+
+        imgs = batch.get("img", None)
+        if imgs is None or not torch.is_tensor(imgs):
+            return
+
+        # Reset caches
+        self._fm_last.clear()
+        self._seg_cache = {}
+
+        # Temp hooks
+        self._register_temp_fm_hooks(base_model)
+
+        try:
+            base_model.eval()
+
+            # Cast inputs to match model parameter dtype to avoid half/float mismatch
+            try:
+                p = next(base_model.parameters())
+                param_dtype = p.dtype
+            except StopIteration:
+                param_dtype = imgs.dtype
+            imgs_cast = imgs.to(self.device, dtype=param_dtype, non_blocking=True)
+
+            # Autocast only on CUDA; keep disabled otherwise
+            use_cuda = (self.device.type == "cuda")
+            use_amp = use_cuda and (param_dtype in (torch.float16, torch.bfloat16))
+            autocast_ctx = torch.cuda.amp.autocast(enabled=use_amp) if use_cuda else contextlib.nullcontext()
+
+            with torch.no_grad(), autocast_ctx:
+                out = base_model(imgs_cast)
+
+            # Cache seg logits for panel if this is a segmentation batch
+            seg_out = self._extract_seg_predictions(out)
+            if isinstance(seg_out, dict):
+                self._seg_cache = {k: v.detach() for k, v in seg_out.items() if torch.is_tensor(v)}
+            elif torch.is_tensor(seg_out):
+                self._seg_cache = {"full": seg_out.detach()}
+        except Exception as e:
+            LOGGER.warning(f"[CAMTLValidator] forced forward for FM/seg capture failed: {e}")
+        finally:
+            # Critical: remove hooks before any save() that might pickle the model
+            self._remove_fm_hooks()
+
+        # Save FM tensors (first image only)
+        _ = self._save_feature_maps(Path(fm_dir), batch) if self._fm_last else 0
+
+        # Save predictions
+        if is_seg_batch and self._seg_cache:
+            # Build the requested 1x4 panel
+            img0 = batch["img"][0] if batch["img"].ndim == 4 else batch["img"]  # CHW
+            panel_path = Path(seg_dir) / "panel_seg.png"
+            self._save_camtl_panel(panel_path, img0, self._seg_cache)
+        elif (not is_seg_batch) and isinstance(det_preds, (list, tuple)):
+            _ = self._save_detect_preds(Path(det_dir), batch, det_preds)
+
+
+    def _save_camtl_panel(self, out_path: Path, img_chw: torch.Tensor, seg_dict: Dict[str, torch.Tensor]) -> None:
+        """
+        Save a 1x4 panel: [original+full] | [p3] | [p4] | [p5] at native sizes.
+        No upsampling. Uses nearest rendering to preserve pixel scale.
+        Handles 4D tensors by selecting the first image in the batch.
+        """
+        import matplotlib.pyplot as plt
+        import numpy as np
+
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Ensure image is CHW
+        if img_chw.ndim == 4:
+            img_chw = img_chw[0]
+        if img_chw.ndim != 3:
+            raise ValueError(f"_save_camtl_panel expected CHW image, got shape={tuple(img_chw.shape)}")
+
+        # Prepare base image (C,H,W) -> BGR HxWxC
+        x = img_chw.detach().float().clamp(0, 1).cpu().numpy()  # CHW
+        x = (x * 255.0).round().astype(np.uint8)
+        x = np.transpose(x, (1, 2, 0))
+        if x.shape[2] == 1:
+            x = np.repeat(x, 3, axis=2)
+        img_bgr = x[:, :, ::-1]
+
+        # Single-image per-scale tensors
+        single_seg: Dict[str, torch.Tensor] = {}
+        for k in ("p3", "p4", "p5", "full"):
+            t = seg_dict.get(k, None)
+            if torch.is_tensor(t):
+                if t.ndim == 4:
+                    t = t[0]
+                single_seg[k] = t
+
+        def _as_2d(m: torch.Tensor) -> np.ndarray:
+            a = m.detach().float().cpu()
+            if a.ndim == 3 and a.shape[0] == 1:
+                a = a.squeeze(0)
+            if a.ndim == 3:
+                a = a[0]
+            return torch.sigmoid(a).numpy()
+
+        p3 = single_seg.get("p3", None)
+        p4 = single_seg.get("p4", None)
+        p5 = single_seg.get("p5", None)
+        full = single_seg.get("full", None)
+
+        fig, axs = plt.subplots(1, 4, figsize=(12, 3), squeeze=True)
+
+        # Panel 1: original + full overlay if available (no resize)
+        axs[0].imshow(img_bgr[..., ::-1])  # display RGB
+        axs[0].set_title("img + full")
+        if isinstance(full, torch.Tensor):
+            mf = _as_2d(full)
+            axs[0].imshow(mf, alpha=0.35, interpolation="nearest")
+        axs[0].axis("off")
+
+        # Panels 2-4: P3/P4/P5 at native sizes, no interpolation to 512
+        for j, (title, tt) in enumerate([("P3", p3), ("P4", p4), ("P5", p5)], start=1):
+            axs[j].set_title(title)
+            if isinstance(tt, torch.Tensor):
+                mj = _as_2d(tt)
+                axs[j].imshow(mj, interpolation="nearest")
+            axs[j].axis("off")
+
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=200, bbox_inches="tight")
+        plt.close(fig)
+
+
+
+    def _save_feature_maps(self, fm_dir: Path, batch: Dict[str, Any]) -> int:
+        from pathlib import Path
+        fm_dir = Path(fm_dir)
+        fm_dir.mkdir(parents=True, exist_ok=True)
+        img_tensor = batch.get("img", torch.empty(0))
+        B = int(getattr(img_tensor, "shape", [0])[0]) if hasattr(img_tensor, "shape") else 0
+        im_files = batch.get("im_file", [str(i) for i in range(B)])
+        n_saved = 0
+        for li, t in sorted(self._fm_last.items()):
+            if not torch.is_tensor(t) or t.ndim < 3:
+                continue
+            bsz = t.shape[0]
+            for bi in range(min(B, bsz, 1)):  # one image is enough
+                stem = Path(im_files[bi]).stem if isinstance(im_files, (list, tuple)) and len(im_files) > bi else str(bi)
+                out_path = fm_dir / f"{stem}_{li}.pt"
+                torch.save({"layer_index": int(li), "shape": tuple(t[bi].shape), "tensor": t[bi].cpu()}, out_path)
+                n_saved += 1
+        return n_saved
+
+    def _img_tensor_to_bgr(self, t: torch.Tensor) -> np.ndarray:
+        import numpy as np
+        if t.ndim != 3:
+            raise ValueError(f"expected CHW, got shape={tuple(t.shape)}")
+        x = t.detach().float().clamp(0, 1).cpu().numpy()       # CHW, 0..1
+        x = (x * 255.0).round().astype(np.uint8)               # CHW, 0..255
+        x = np.transpose(x, (1, 2, 0))                         # HWC
+        if x.shape[2] == 1:
+            x = np.repeat(x, 3, axis=2)
+        return x[:, :, ::-1]                                   # RGB->BGR
+
+    def _draw_dets(self, img_bgr: np.ndarray, boxes_xyxy: np.ndarray,
+                cls: np.ndarray, conf: np.ndarray) -> np.ndarray:
+        import cv2
+        out = img_bgr.copy()
+        n = boxes_xyxy.shape[0]
+        for i in range(n):
+            x1, y1, x2, y2 = boxes_xyxy[i].astype(int).tolist()
+            label = f"{int(cls[i])}:{float(conf[i]):.2f}"
+            cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 0), 2, lineType=cv2.LINE_AA)
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
+            y1t = max(y1, th + 3)
+            cv2.rectangle(out, (x1, y1t - th - 4), (x1 + tw + 4, y1t), (0, 255, 0), -1)
+            cv2.putText(out, label, (x1 + 2, y1t - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1, cv2.LINE_AA)
+        return out
+
+    def _save_detect_preds(self, det_dir: "Path", batch: Dict[str, Any], det_preds: Any) -> int:
+        from pathlib import Path
+        import numpy as np
+        import cv2
+        det_dir = Path(det_dir)
+        det_dir.mkdir(parents=True, exist_ok=True)
+        img_tensor = batch.get("img", torch.empty(0))
+        B = int(getattr(img_tensor, "shape", [0])[0]) if hasattr(img_tensor, "shape") else 0
+        im_files = batch.get("im_file", [str(i) for i in range(B)])
+        n_overlays = 0
+        if not isinstance(det_preds, (list, tuple)):
+            return 0
+        for bi in range(min(B, len(det_preds), 1)):  # save first image of the batch
+            stem = Path(im_files[bi]).stem if len(im_files) > bi else str(bi)
+            try:
+                img_bgr = self._img_tensor_to_bgr(img_tensor[bi])
+                p = det_preds[bi] if isinstance(det_preds[bi], dict) else {}
+                boxes = np.asarray(p.get("bboxes", torch.zeros((0, 4))).detach().cpu().numpy())
+                conf = np.asarray(p.get("conf", torch.zeros((0,))).detach().cpu().numpy())
+                cls = np.asarray(p.get("cls", torch.zeros((0,))).detach().cpu().numpy())
+                overlay = self._draw_dets(img_bgr, boxes, cls, conf)
+                cv2.imwrite(str(det_dir / f"{stem}_pred.jpg"), overlay)
+                n_overlays += 1
+            except Exception as e:
+                from camtl_yolo.external.ultralytics.ultralytics.utils import LOGGER
+                LOGGER.debug(f"[CAMTLValidator] detect overlay save failed for {stem}: {e}")
+        return n_overlays
+
+    def _save_seg_preds(self, seg_dir: "Path", batch: Dict[str, Any]) -> int:
+        from pathlib import Path
+        import cv2
+        seg_dir = Path(seg_dir)
+        seg_dir.mkdir(parents=True, exist_ok=True)
+        if not self._seg_cache:
+            return 0
+        img_tensor = batch.get("img", torch.empty(0))
+        B = int(getattr(img_tensor, "shape", [0])[0]) if hasattr(img_tensor, "shape") else 0
+        im_files = batch.get("im_file", [str(i) for i in range(B)])
+        n_masks = 0
+        for bi in range(min(B, 1)):  # save first image only
+            stem = Path(im_files[bi]).stem if len(im_files) > bi else str(bi)
+            for sk, t in self._seg_cache.items():
+                try:
+                    m = t[bi]
+                    if m.ndim == 3 and m.shape[0] == 1:
+                        m = m.squeeze(0)
+                    m = torch.sigmoid(m).detach().cpu().numpy()
+                    if m.ndim == 3:
+                        m = m[0]
+                    m_img = (m * 255).astype("uint8")
+                    cv2.imwrite(str(seg_dir / f"{stem}_{sk}.png"), m_img)
+                    n_masks += 1
+                except Exception:
+                    pass
+        return n_masks
+
+    def _remove_fm_hooks(self) -> None:
+        """Remove any registered hooks to keep the model pickle-safe."""
+        for h in getattr(self, "_fm_hook_handles", []):
+            try:
+                h.remove()
+            except Exception:
+                pass
+        self._fm_hook_handles = []

@@ -310,6 +310,10 @@ class CAMTL_YOLO(DetectionModel):
         if has_det:
             try:
                 l_det, _det_items = self.detect_criterion(det_preds, batch)
+                det_box = float(getattr(_det_items, "get", lambda *_: 0.0)("box") if isinstance(_det_items, dict) else 0.0)
+                det_cls = float(getattr(_det_items, "get", lambda *_: 0.0)("cls") if isinstance(_det_items, dict) else 0.0)
+                det_dfl = float(getattr(_det_items, "get", lambda *_: 0.0)("dfl") if isinstance(_det_items, dict) else 0.0)
+                
                 loss_det = l_det if l_det.ndim == 0 else l_det.sum()
             except Exception as e:
                 LOGGER.warning(f"[loss] detection loss failed: {e}")
@@ -319,6 +323,15 @@ class CAMTL_YOLO(DetectionModel):
         if has_seg:
             try:
                 l_seg, _seg_items = self.segment_criterion(seg_preds, batch)
+            
+                # l_seg, seg_items = self.segment_criterion(...); seg_items has '{p3,p4,p5}_{bce,dice}'
+                p3_bce = float(_seg_items.get("p3_bce", 0.0)) if isinstance(_seg_items, dict) else 0.0
+                p4_bce = float(_seg_items.get("p4_bce", 0.0)) if isinstance(_seg_items, dict) else 0.0
+                p5_bce = float(_seg_items.get("p5_bce", 0.0)) if isinstance(_seg_items, dict) else 0.0
+                p3_dice = float(_seg_items.get("p3_dice", 0.0)) if isinstance(_seg_items, dict) else 0.0
+                p4_dice = float(_seg_items.get("p4_dice", 0.0)) if isinstance(_seg_items, dict) else 0.0
+                p5_dice = float(_seg_items.get("p5_dice", 0.0)) if isinstance(_seg_items, dict) else 0.0
+
                 loss_seg = l_seg if l_seg.ndim == 0 else l_seg.sum()
             except Exception as e:
                 LOGGER.warning(f"[loss] segmentation loss failed: {e}")
@@ -354,10 +367,32 @@ class CAMTL_YOLO(DetectionModel):
             + l2sp_term
         )
 
-        loss_items = torch.stack(
-            [loss_det.detach(), loss_seg.detach(), cons_loss.detach(),
-            align_loss.detach(), l2sp_term.detach(), total.detach()]
-        )
+        loss_items = [
+            loss_det.detach(), 
+            loss_seg.detach(), 
+            cons_loss.detach(), 
+            align_loss.detach(), 
+            l2sp_term.detach(), 
+            total.detach(),
+        ]
+
+        if has_det:
+            loss_items.extend([
+                torch.tensor(det_box, device=total.device, dtype=total.dtype),
+                torch.tensor(det_cls, device=total.device, dtype=total.dtype),
+                torch.tensor(det_dfl, device=total.device, dtype=total.dtype),
+            ])
+        if has_seg:
+            loss_items.extend([
+                torch.tensor(p3_bce, device=total.device, dtype=total.dtype),
+                torch.tensor(p4_bce, device=total.device, dtype=total.dtype),
+                torch.tensor(p5_bce, device=total.device, dtype=total.dtype),
+                torch.tensor(p3_dice, device=total.device, dtype=total.dtype),
+                torch.tensor(p4_dice, device=total.device, dtype=total.dtype),
+                torch.tensor(p5_dice, device=total.device, dtype=total.dtype),
+            ])
+
+        loss_items = torch.stack(loss_items) if loss_items else torch.zeros(6, device=device)
         return total, loss_items
 
     @torch.no_grad()

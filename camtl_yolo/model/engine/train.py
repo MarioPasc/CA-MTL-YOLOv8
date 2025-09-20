@@ -315,7 +315,19 @@ class CAMTLTrainer(BaseTrainer):
     def get_validator(self):
         """Return CAMTL validator."""
         # losses: det, seg, cons, align, l2sp, total
-        self.loss_names = ("det", "seg", "cons", "align", "l2sp", "total")
+        if self.model.task == "DomainShift1":
+            self.loss_names = (
+                "det", "seg", "cons", "align", "l2sp", "total",
+                "|  p3_bce", "p4_bce", "p5_bce",
+                "|  p3_dice", "p4_dice", "p5_dice",
+            )
+        else:
+            self.loss_names = (
+                "det", "seg", "cons", "align", "l2sp", "total",
+                "|  box", "cls", "dfl",
+                "|  p3_bce", "p4_bce", "p5_bce",
+                "|  p3_dice", "p4_dice", "p5_dice",
+            )
         return CAMTLValidator(self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks)
 
     def label_loss_items(self, loss_items: torch.Tensor | None = None, prefix: str = "train"):

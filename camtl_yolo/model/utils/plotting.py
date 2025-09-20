@@ -19,7 +19,10 @@ import logging
 import csv
 
 import matplotlib.pyplot as plt
-
+import numpy as np
+import cv2
+import matplotlib
+matplotlib.use("Agg") 
 
 # =========================
 # Style configuration block
@@ -48,7 +51,7 @@ def configure_matplotlib() -> None:
 	try:
 		import importlib
 		importlib.import_module("scienceplots")
-		plt.style.use(["science", "ieee"])  # base science + ieee style
+		plt.style.use(["science"])  # base science + latex style
 	except Exception as e:  # pragma: no cover - env dependent
 		logging.warning("scienceplots not available: %s. Continuing with default style.", e)
 
@@ -385,4 +388,151 @@ def plot_camtl_metrics(trainer) -> None:
 				pass
 	except Exception as e:
 		logging.warning("CAMTL dice plotting failed: %s", e)
+
+
+# =========================
+# Augmentation debug grid (pre/post + downsampled)
+# =========================
+
+def overlay_mask_on_image_bgr(
+    img_bgr: np.ndarray,
+    mask2d: np.ndarray,
+    color: Tuple[int, int, int] = (0, 0, 255),
+    alpha: float = 0.6,
+) -> np.ndarray:
+    """Overlay a binary/soft mask on a BGR image with given color and alpha.
+
+    Background (mask==0) remains unchanged. Activated pixels blend towards 'color'.
+    mask2d can be float in [0,1] or uint8 in {0,255}.
+    """
+    assert img_bgr.ndim == 3 and img_bgr.shape[2] == 3, "img_bgr must be HxWx3"
+    h, w = img_bgr.shape[:2]
+    if mask2d.shape != (h, w):
+        mask2d = cv2.resize(mask2d, (w, h), interpolation=cv2.INTER_NEAREST)
+
+    img = img_bgr.astype(np.float32)
+    if mask2d.dtype != np.float32:
+        m = mask2d.astype(np.float32)
+        if m.max() > 1.0:
+            m = m / 255.0
+    else:
+        m = mask2d
+    m = np.clip(m, 0.0, 1.0)
+    overlay = np.zeros_like(img) + np.array(color, dtype=np.float32)
+    # Blend only where m>0
+    m3 = m[..., None]
+    comp = img * (1.0 - alpha * m3) + overlay * (alpha * m3)
+    return np.clip(comp, 0, 255).astype(np.uint8)
+
+
+def _to_vis_bgr_from_mask(mask2d: np.ndarray, target_hw: Tuple[int, int]) -> np.ndarray:
+    """Convert a single-channel mask to 3-channel BGR image for visualization."""
+    h, w = target_hw
+    if mask2d.shape != (h, w):
+        mask2d = cv2.resize(mask2d, (w, h), interpolation=cv2.INTER_NEAREST)
+    if mask2d.dtype != np.uint8:
+        m = np.clip(mask2d, 0.0, 1.0)
+        mask_u8 = (m * 255).astype(np.uint8)
+    else:
+        mask_u8 = mask2d
+    return cv2.cvtColor(mask_u8, cv2.COLOR_GRAY2BGR)
+
+
+def save_aug_debug_grid(
+    out_path: Path,
+    pre_img_bgr: np.ndarray,
+    pre_mask2d: Optional[np.ndarray],
+    pre_p3: Optional[np.ndarray],
+    pre_p4: Optional[np.ndarray],
+    pre_p5: Optional[np.ndarray],
+    post_img_bgr: np.ndarray,
+    post_mask2d: Optional[np.ndarray],
+    post_p3: Optional[np.ndarray],
+    post_p4: Optional[np.ndarray],
+    post_p5: Optional[np.ndarray],
+) -> Path:
+    """Save a 2x4 grid image using Matplotlib with annotated tiles.
+
+    Row 0: pre-augmentation [image+full overlay] | [p3] | [p4] | [p5]
+    Row 1: post-augmentation [image+full overlay] | [p3] | [p4] | [p5]
+    """
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Convert BGR images to RGB for Matplotlib
+    pre_img_rgb = cv2.cvtColor(pre_img_bgr, cv2.COLOR_BGR2RGB)
+    post_img_rgb = cv2.cvtColor(post_img_bgr, cv2.COLOR_BGR2RGB)
+
+    # Normalize masks to [0,1] and build masked arrays so zero stays transparent
+    def _norm_mask(m: Optional[np.ndarray]) -> Optional[np.ma.MaskedArray]:
+        if m is None:
+            return None
+        mm = m.astype(np.float32)
+        if mm.max() > 1.0:
+            mm = mm / 255.0
+        mm = np.clip(mm, 0.0, 1.0)
+        return np.ma.masked_where(mm <= 0.0, mm)
+
+    m_pre = _norm_mask(pre_mask2d)
+    m_post = _norm_mask(post_mask2d)
+
+    # For p3/p4/p5, visualize masks (resized to image shape for clarity)
+    H, W = pre_img_bgr.shape[:2]
+    def _resize_mask(m: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        if m is None:
+            return None
+        return cv2.resize(m, (W, H), interpolation=cv2.INTER_NEAREST)
+
+    pre_p3_r = _resize_mask(pre_p3)
+    pre_p4_r = _resize_mask(pre_p4)
+    pre_p5_r = _resize_mask(pre_p5)
+    post_p3_r = _resize_mask(post_p3)
+    post_p4_r = _resize_mask(post_p4)
+    post_p5_r = _resize_mask(post_p5)
+
+    fig, axes = plt.subplots(2, 4, figsize=(12, 6), squeeze=True, constrained_layout=True)
+
+    # Top row: pre
+    ax = axes[0, 0]
+    ax.imshow(pre_img_rgb)
+    if m_pre is not None:
+        ax.imshow(m_pre, cmap="Reds", vmin=0, vmax=1, alpha=0.6)
+    ax.set_title("pre: overlay")
+    ax.axis("off")
+
+    for j, (ax, m, title) in enumerate([
+        (axes[0, 1], pre_p3_r, "pre: p3"),
+        (axes[0, 2], pre_p4_r, "pre: p4"),
+        (axes[0, 3], pre_p5_r, "pre: p5"),
+    ]):
+        if m is None:
+            ax.imshow(np.zeros((H, W), dtype=np.uint8), cmap="gray", vmin=0, vmax=255)
+        else:
+            ax.imshow(m, cmap="gray", vmin=0, vmax=1)
+        ax.set_title(title)
+        ax.axis("off")
+
+    # Bottom row: post
+    ax = axes[1, 0]
+    ax.imshow(post_img_rgb)
+    if m_post is not None:
+        ax.imshow(m_post, cmap="Reds", vmin=0, vmax=1, alpha=0.6)
+    ax.set_title("post: overlay")
+    ax.axis("off")
+
+    for j, (ax, m, title) in enumerate([
+        (axes[1, 1], post_p3_r, "post: p3"),
+        (axes[1, 2], post_p4_r, "post: p4"),
+        (axes[1, 3], post_p5_r, "post: p5"),
+    ]):
+        if m is None:
+            ax.imshow(np.zeros((H, W), dtype=np.uint8), cmap="gray", vmin=0, vmax=255)
+        else:
+            ax.imshow(m, cmap="gray", vmin=0, vmax=1)
+        ax.set_title(title)
+        ax.axis("off")
+
+    fig.savefig(str(out_path), dpi=200)
+    plt.close(fig)
+    return out_path
 

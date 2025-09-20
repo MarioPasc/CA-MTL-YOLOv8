@@ -12,6 +12,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from camtl_yolo.model.utils.downsample_mask import downsample_mask_prob 
+from camtl_yolo.model.utils import plotting as plot_utils
 
 try:
     from camtl_yolo.external.ultralytics.ultralytics.data.dataset import BaseDataset
@@ -259,33 +260,46 @@ class MultiTaskJSONDataset(BaseDataset):
                     if do_save:
                         Path(out_dir).mkdir(parents=True, exist_ok=True)
                         stem = Path(label.get("im_file", "img")).stem
-                        # Pre augmentation saves
-                        pre_img_path = Path(out_dir) / f"{stem}_pre_img.png"
-                        try:
-                            if isinstance(img_bgr_pre, np.ndarray):
-                                cv2.imwrite(str(pre_img_path), img_bgr_pre)
-                        except Exception as _:
-                            pass
-                        if mask_pre is not None:
-                            try:
-                                pre_mask_u8 = (mask_pre[0] > 0.5).astype(np.uint8) * 255
-                                cv2.imwrite(str(Path(out_dir) / f"{stem}_pre_mask.png"), pre_mask_u8)
-                            except Exception as _:
-                                pass
-                        # Post augmentation saves (current img_bgr/mask)
-                        try:
-                            cv2.imwrite(str(Path(out_dir) / f"{stem}_post_img.png"), img_bgr)
-                        except Exception as _:
-                            pass
-                        if mask is not None:
-                            try:
-                                post_mask_u8 = (mask[0] > 0.5).astype(np.uint8) * 255
-                                cv2.imwrite(str(Path(out_dir) / f"{stem}_post_mask.png"), post_mask_u8)
-                            except Exception as _:
-                                pass
+                        # Compute downsampled masks for pre and post (if segmentation)
+                        pre_m2d = mask_pre[0] if mask_pre is not None else None
+                        post_m2d = mask[0] if mask is not None else None
+
+                        def ds_all(m2d: Optional[np.ndarray]):
+                            if m2d is None:
+                                return None, None, None
+                            m3 = downsample_mask_prob(m2d, stride=8,  method="avgpool")
+                            m4 = downsample_mask_prob(m2d, stride=16, method="avgpool")
+                            m5 = downsample_mask_prob(m2d, stride=32, method="avgpool")
+                            return m3, m4, m5
+
+                        pre_p3, pre_p4, pre_p5 = ds_all(pre_m2d)
+                        post_p3, post_p4, post_p5 = ds_all(post_m2d)
+
+                        # Save composite 2x4 grid visualization
+                        out_grid = Path(out_dir) / f"{stem}_aug_grid.png"
+                        saved_path = plot_utils.save_aug_debug_grid(
+                            out_grid,
+                            pre_img_bgr=img_bgr_pre,
+                            pre_mask2d=pre_m2d,
+                            pre_p3=pre_p3,
+                            pre_p4=pre_p4,
+                            pre_p5=pre_p5,
+                            post_img_bgr=img_bgr,
+                            post_mask2d=post_m2d,
+                            post_p3=post_p3,
+                            post_p4=post_p4,
+                            post_p5=post_p5,
+                        )
+                        if saved_path and Path(saved_path).exists():
+                            LOGGER.debug(f"[aug-debug] Saved grid to: {saved_path}")
+                        else:
+                            LOGGER.warning(f"[aug-debug] Failed to save grid to: {out_grid}")
                         self._aug_save_count += 1
+                else:
+                    # Saving is enabled but we've reached the cap; log only once per epoch if needed
+                    pass
             except Exception as e:  # pragma: no cover
-                LOGGER.debug(f"Failed saving augmented mask/image for path {label.get('im_file','')}: {e}")
+                LOGGER.warning(f"[aug-debug] Exception while saving aug grid for {label.get('im_file','')}: {e}")
 
             # Normalize channel layout to contiguous RGB
             if img_bgr.ndim == 2:

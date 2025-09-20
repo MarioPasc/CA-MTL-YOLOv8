@@ -5,9 +5,9 @@ model: ../models/camtl_yolov8.yaml
 data: ../data/data.yaml
 
 project: /home/mpascual/research/results/camtl_yolo
-name: CA-MTL-YOLOv8
+name: DomainShift1
 
-epochs: 2
+epochs: 4
 batch: 2 
 imgsz: 512 
 
@@ -33,9 +33,9 @@ cls: 0.5 # (float) cls loss gain (scale with pixels)
 dfl: 1.5 # (float) dfl loss gain
 
 ## Enabled augmentation hyperparameters ##
-translate: 0.9 # (float) image translation (+/- fraction)
-scale: 0.9 # (float) image scale (+/- gain)
-fliplr: 0.9 # (float) image flip left-right (probability)
+translate: 0.2 # (float) image translation (+/- fraction)
+scale: 0.2 # (float) image scale (+/- gain)
+fliplr: 0.4 # (float) image flip left-right (probability)
 
 ## Disabled augmentation hyperparameters ##
 degrees: 0 # (float) image rotation (+/- deg)

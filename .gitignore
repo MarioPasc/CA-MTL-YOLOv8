@@ -213,3 +213,4 @@ __marimo__/
 *.model
 *.torchscript
 tmp/
+assets/*.png
