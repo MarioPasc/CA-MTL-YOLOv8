@@ -9,6 +9,7 @@ from copy import copy
 import csv
 import yaml # type: ignore
 import matplotlib.pyplot as plt
+from camtl_yolo.model.utils import plotting as plot_utils
 
 import torch
 import torch.nn as nn
@@ -255,9 +256,13 @@ class CAMTLTrainer(BaseTrainer):
                 ratio = getattr(self.args, "camtl_ratio", None) or getattr(self.model, "yaml", {}).get("CAMTL_RATIO", [1, 1])
                 rx, ry = int(ratio[0]), int(ratio[1])
                 alt = AlternatingLoader(det_loader, seg_loader, ratio=(rx, ry))
-                alt.num_workers = getattr(det_loader, "num_workers", 0) + getattr(seg_loader, "num_workers", 0)
-                alt.batch_size = batch_size
-                alt.ratio = (rx, ry)
+                # Attach a few convenience attributes dynamically for logging/metrics
+                try:
+                    setattr(alt, "num_workers", getattr(det_loader, "num_workers", 0) + getattr(seg_loader, "num_workers", 0))
+                    setattr(alt, "batch_size", batch_size)
+                    setattr(alt, "ratio", (rx, ry))
+                except Exception:
+                    pass
                 return alt
 
             # For CAMTL val: single union loader, no alternation
@@ -463,64 +468,11 @@ class CAMTLTrainer(BaseTrainer):
             LOGGER.warning(f"[plot_metrics] CAMTL plotting failed: {e}")
 
     def _plot_camtl_metrics(self) -> None:
-        """
-        Make CAMTL-specific figures:
-          - results_camtl_dice.png: val/dice_{p3,p4,p5,full} across epochs
-          - results_camtl_losses.png: train/{det,seg,cons,align,l2sp,total} across epochs
-        Uses BaseTrainer.read_results_csv with a builtin CSV fallback.
-        """
-        # Load CSV into dict[str, list]
+        """Delegate CAMTL plots to centralized plotting utilities."""
         try:
-            table = self.read_results_csv()  # polars-backed, returns dict of lists
-        except Exception:
-            # Fallback light parser
-            table = {}
-            with open(self.csv, "r", encoding="utf-8") as f:
-                reader = csv.reader(f)
-                header = next(reader)
-                cols = [[] for _ in header]
-                for row in reader:
-                    for i, v in enumerate(row):
-                        try:
-                            cols[i].append(float(v))
-                        except Exception:
-                            cols[i].append(float("nan"))
-            table = {h: cols[i] for i, h in enumerate(header)}
-
-        if not table:
-            return
-
-        epochs = table.get("epoch", list(range(1, len(next(iter(table.values()), [])) + 1)))
-
-        # --- Dice per scale figure ---
-        dice_keys = [k for k in ("val/dice_p3", "val/dice_p4", "val/dice_p5", "val/dice_full") if k in table]
-        if dice_keys:
-            plt.figure()
-            for k in dice_keys:
-                plt.plot(epochs, table[k], label=k.replace("val/", ""))
-            plt.xlabel("epoch")
-            plt.ylabel("Dice")
-            plt.title("Per-scale Dice")
-            plt.legend()
-            out = self.save_dir / "results_camtl_dice.png"
-            plt.savefig(out, bbox_inches="tight", dpi=200)
-            plt.close()
-            self.on_plot(str(out))
-
-        # --- Loss components figure ---
-        loss_keys = [k for k in ("train/det", "train/seg", "train/cons", "train/align", "train/l2sp", "train/total") if k in table]
-        if loss_keys:
-            plt.figure()
-            for k in loss_keys:
-                plt.plot(epochs, table[k], label=k.replace("train/", ""))
-            plt.xlabel("epoch")
-            plt.ylabel("loss")
-            plt.title("CAMTL Loss Components")
-            plt.legend()
-            out = self.save_dir / "results_camtl_losses.png"
-            plt.savefig(out, bbox_inches="tight", dpi=200)
-            plt.close()
-            self.on_plot(str(out))
+            plot_utils.plot_camtl_metrics(self)
+        except Exception as e:
+            LOGGER.warning(f"[plot_metrics] CAMTL plotting failed: {e}")
 
     # ------------------------ Progress String ------------------------ #
 

@@ -133,6 +133,8 @@ class MultiTaskJSONDataset(BaseDataset):
         self.include_keys = list(tasks) if tasks else list(self.JSON_KEYS)
         self.filter_is = filter_is
         self._records: List[SampleRec] = []
+        # Debug counter for optional augmentation saves
+        self._aug_save_count: int = 0
         super().__init__(
             img_path="__json__", imgsz=imgsz, cache=cache, augment=augment, hyp=hyp or {}, prefix=prefix,
             rect=rect, batch_size=batch_size, stride=stride, pad=pad, single_cls=single_cls,
@@ -228,6 +230,10 @@ class MultiTaskJSONDataset(BaseDataset):
                     m = cv2.resize(m, (W, H), interpolation=cv2.INTER_NEAREST)
                 mask = (m > 0).astype(np.float32)[None, ...]
 
+            # Keep pre-augmentation copies (after any initial size alignment, before flips)
+            img_bgr_pre = img_bgr.copy()
+            mask_pre = None if mask is None else mask.copy()
+
             bboxes = label.get("bboxes", np.zeros((0, 4), dtype=np.float32))
             cls = label.get("cls", np.zeros((0, 1), dtype=np.float32))
 
@@ -244,13 +250,50 @@ class MultiTaskJSONDataset(BaseDataset):
                 if bboxes.size:
                     bboxes[:, 1] = 1.0 - bboxes[:, 1]
 
+            # Optional debugging: save pre/post augmented image and mask
+            try:
+                out_dir = os.getenv("CAMTL_SAVE_AUG_MASKS", "")
+                if out_dir:
+                    max_saves = int(os.getenv("CAMTL_SAVE_MAX", "0") or 0)
+                    do_save = max_saves <= 0 or (self._aug_save_count < max_saves)
+                    if do_save:
+                        Path(out_dir).mkdir(parents=True, exist_ok=True)
+                        stem = Path(label.get("im_file", "img")).stem
+                        # Pre augmentation saves
+                        pre_img_path = Path(out_dir) / f"{stem}_pre_img.png"
+                        try:
+                            if isinstance(img_bgr_pre, np.ndarray):
+                                cv2.imwrite(str(pre_img_path), img_bgr_pre)
+                        except Exception as _:
+                            pass
+                        if mask_pre is not None:
+                            try:
+                                pre_mask_u8 = (mask_pre[0] > 0.5).astype(np.uint8) * 255
+                                cv2.imwrite(str(Path(out_dir) / f"{stem}_pre_mask.png"), pre_mask_u8)
+                            except Exception as _:
+                                pass
+                        # Post augmentation saves (current img_bgr/mask)
+                        try:
+                            cv2.imwrite(str(Path(out_dir) / f"{stem}_post_img.png"), img_bgr)
+                        except Exception as _:
+                            pass
+                        if mask is not None:
+                            try:
+                                post_mask_u8 = (mask[0] > 0.5).astype(np.uint8) * 255
+                                cv2.imwrite(str(Path(out_dir) / f"{stem}_post_mask.png"), post_mask_u8)
+                            except Exception as _:
+                                pass
+                        self._aug_save_count += 1
+            except Exception as e:  # pragma: no cover
+                LOGGER.debug(f"Failed saving augmented mask/image for path {label.get('im_file','')}: {e}")
+
             # Normalize channel layout to contiguous RGB
             if img_bgr.ndim == 2:
                 img_bgr = cv2.cvtColor(img_bgr, cv2.COLOR_GRAY2BGR)
             elif img_bgr.shape[2] == 4:
                 img_bgr = cv2.cvtColor(img_bgr, cv2.COLOR_BGRA2BGR)
             img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-            chw = np.ascontiguousarray(img_rgb.transpose(2,0,1))
+            chw = np.ascontiguousarray(img_rgb.transpose(2, 0, 1))
             img = torch.from_numpy(chw).float() / 255.0
 
             out: Dict[str, Any] = {
