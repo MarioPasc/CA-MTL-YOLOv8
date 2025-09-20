@@ -15,7 +15,7 @@ from typing import Dict, List, Optional
 import torch
 import torch.nn as nn
 from camtl_yolo.external.ultralytics.ultralytics.nn.modules import Detect
-from camtl_yolo.model.nn import CTAM, CSAM, FPMA, SegHead
+from camtl_yolo.model.nn import CTAM, CSAM, FPMA, SegHeadMulti
 from camtl_yolo.model.losses.regularizers import L2SPRegularizer, snapshot_reference
 from camtl_yolo.external.ultralytics.ultralytics.utils import LOGGER
 from camtl_yolo.model.utils.normalization import (
@@ -73,7 +73,7 @@ def parameter_groups(model: nn.Module) -> Dict[str, List[nn.Parameter]]:
     for mod in model.modules():
         if isinstance(mod, Detect):
             key = "detect_head"
-        elif isinstance(mod, SegHead):
+        elif isinstance(mod, SegHeadMulti):
             key = "seg_head"
         elif _is_attention(mod):
             key = "attention"
@@ -109,6 +109,8 @@ def configure_task(
     mode = str(mode)
     l2sp: Optional[L2SPRegularizer] = None
     frozen: List[str] = []
+    include_names: set[str] = set()
+
 
     if mode == "DomainShift1":
         # Normalization: GN in segmentation stream; keep single BN elsewhere
@@ -118,11 +120,10 @@ def configure_task(
         # Freeze Detect
         frozen = freeze_detect_head(model, bn_eval=True)
         # L2-SP over backbone/neck
-        include_names: set[str] = set()
         for n, p in model.named_parameters():
             if not p.requires_grad:
                 continue
-            if any(tag in n for tag in (".cv2.", ".cv3.", ".dfl.", "SegHead", "CTAM", "CSAM", "FPMA")):
+            if any(tag in n for tag in (".cv2.", ".cv3.", ".dfl.", "SegHeadMulti", "CTAM", "CSAM", "FPMA")):
                 continue
             include_names.add(n)
         def _include(name: str, param: nn.Parameter) -> bool: return name in include_names
@@ -142,9 +143,8 @@ def configure_task(
                 for p in mod.parameters(recurse=True):
                     p.requires_grad = True
         # L2-SP still on backbone/neck
-        include_names: set[str] = set()
         for n, p in model.named_parameters():
-            if any(tag in n for tag in (".cv2.", ".cv3.", ".dfl.", "SegHead", "CTAM", "CSAM", "FPMA")):
+            if any(tag in n for tag in (".cv2.", ".cv3.", ".dfl.", "SegHeadMulti", "CTAM", "CSAM", "FPMA")):
                 continue
             include_names.add(n)
         def _include(name: str, param: nn.Parameter) -> bool: return name in include_names

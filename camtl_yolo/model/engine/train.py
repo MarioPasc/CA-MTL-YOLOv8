@@ -1,14 +1,18 @@
 # camtl_yolo/engine/train.py
 from __future__ import annotations
 
-import math
-import random
-from copy import copy
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Mapping, Optional
+
+import math
+from copy import copy
+import csv
+import yaml # type: ignore
+import matplotlib.pyplot as plt
 
 import torch
 import torch.nn as nn
+from torch import optim
 
 from camtl_yolo.model.dataset import MultiTaskJSONDataset, build_dataloader
 from camtl_yolo.model.engine.val import CAMTLValidator
@@ -18,6 +22,7 @@ from camtl_yolo.model.utils.samplers import AlternatingLoader, map_domain_name
 from camtl_yolo.external.ultralytics.ultralytics.engine.trainer import BaseTrainer
 from camtl_yolo.external.ultralytics.ultralytics.utils import DEFAULT_CFG, LOGGER, RANK
 from camtl_yolo.external.ultralytics.ultralytics.utils.torch_utils import torch_distributed_zero_first, unwrap_model
+from camtl_yolo.external.ultralytics.ultralytics.utils.torch_utils import strip_optimizer, unwrap_model
 
 from camtl_yolo.model.utils.ema import SafeModelEMA
 from camtl_yolo.external.ultralytics.ultralytics.utils.torch_utils import (
@@ -28,13 +33,7 @@ from camtl_yolo.external.ultralytics.ultralytics.utils.checks import check_amp
 from camtl_yolo.external.ultralytics.ultralytics.utils import callbacks, LOGGER, RANK, LOCAL_RANK
 from camtl_yolo.external.ultralytics.ultralytics.utils.checks import check_imgsz
 from camtl_yolo.external.ultralytics.ultralytics.utils.autobatch import check_train_batch_size
-from torch import nn, optim
-import numpy as np
-import warnings
-import math
-import time
-import torch
-from copy import copy
+
 
 class CAMTLTrainer(BaseTrainer):
     """
@@ -159,7 +158,6 @@ class CAMTLTrainer(BaseTrainer):
 
     def get_dataset(self) -> Dict[str, Any]:
         """Return dataset meta dict expected by BaseTrainer."""
-        import yaml
 
         data_yaml = Path(self.args.data)
         with data_yaml.open("r", encoding="utf-8") as f:
@@ -193,9 +191,9 @@ class CAMTLTrainer(BaseTrainer):
     ):
         ds = MultiTaskJSONDataset(
             data_yaml=data_yaml,
-            split=split,
+            split=split, # type: ignore[arg-type]
             tasks=tasks,
-            filter_is=filter_is,  # "seg" or "det" or None
+            filter_is=filter_is,  # type: ignore[arg-type]
             imgsz=imgsz,
             augment=(split == "train"),
             hyp=self.args,  # reuse same hyp dict
@@ -322,6 +320,65 @@ class CAMTLTrainer(BaseTrainer):
             return dict(zip(keys, vals))
         return keys
 
+    def final_eval(self):
+        """Evaluate using our task-aware checkpoint (DomainShift1/CAMTL) so criteria exist."""
+
+        # 1) Save a fresh task checkpoint to guarantee it exists
+        task_ckpt_path: Path | None = None
+        try:
+            task_ckpt_path = unwrap_model(self.model).save_task_checkpoint(
+                self.wdir, epoch=self.epoch, optimizer=self.optimizer
+            )
+            task_ckpt_path = Path(task_ckpt_path)
+        except Exception as e:
+            LOGGER.warning(f"[final_eval] save_task_checkpoint failed: {e}")
+
+        # 2) Load task checkpoint as a MODULE and attach criteria
+        val_model = None
+        if task_ckpt_path and task_ckpt_path.exists():
+            ckpt = torch.load(task_ckpt_path, map_location=self.device, weights_only=False)
+            if isinstance(ckpt, dict) and "model" in ckpt and hasattr(ckpt["model"], "state_dict"):
+                val_model = ckpt["model"]
+            elif hasattr(ckpt, "state_dict"):
+                val_model = ckpt  # already a nn.Module
+            else:
+                # Fallback: rebuild model and load state_dict from ckpt["model"]
+                from camtl_yolo.model.model import CAMTL_YOLO
+                val_model = CAMTL_YOLO(cfg=self.model.yaml, ch=self.data["channels"], nc=self.data["nc"], verbose=False)
+                sd = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+                if isinstance(sd, dict):
+                    val_model.load_state_dict(sd, strict=False)
+            val_model = None
+            return
+
+        # 4) Prepare module for validation and ensure criteria are attached
+        base = unwrap_model(val_model)
+        try:
+            base.nc = self.data["nc"]
+            base.names = self.data["names"]
+            base.args = self.args  # SimpleNamespace from get_cfg
+        except Exception:
+            pass
+        try:
+            if not all(hasattr(base, a) for a in ("segment_criterion", "detect_criterion", "consistency_criterion", "align_criterion")):
+                base.init_criterion()
+        except Exception as e:
+            LOGGER.warning(f"[final_eval] init_criterion on task model failed: {e}")
+
+        val_model.to(self.device)
+        use_half = (self.device.type == "cuda") and bool(self.amp)
+        val_model = val_model.half() if use_half else val_model.float()
+        base.eval()
+
+        # 5) Validate with the MODULE (not a Path)
+        LOGGER.info(f"\nValidating task checkpoint {task_ckpt_path}...")
+        self.validator.args.plots = self.args.plots
+        self.validator.args.compile = False
+        self.metrics = self.validator(model=val_model)
+        self.metrics.pop("fitness", None)
+        self.run_callbacks("on_fit_epoch_end")
+
+
     # ------------------------ Save Hook ------------------------ #
 
     def save_model(self):
@@ -332,8 +389,140 @@ class CAMTLTrainer(BaseTrainer):
         except Exception as e:
             LOGGER.warning(f"Task checkpoint save failed: {e}")
 
-    # ------------------------ Progress String ------------------------ #
+    # ------------------------ Metrics persistence & plots ------------------------ #
 
+    def save_metrics(self, metrics: Mapping[str, float]) -> None:  # type: ignore[override]
+        """
+        Save training metrics with CAMTL extras (per-scale Dice and ratio) merged in.
+        Delegates the actual CSV write to BaseTrainer.save_metrics.
+        """
+        try:
+            enriched = dict(metrics)
+            enriched.update(self._camtl_extra_metrics(metrics))
+        except Exception as e:
+            LOGGER.warning(f"[save_metrics] enriching metrics failed: {e}")
+            enriched = dict(metrics)
+        super().save_metrics(enriched)
+
+    def _camtl_extra_metrics(self, metrics: Mapping[str, float]) -> dict[str, float]:
+        """
+        Collect CAMTL-specific extras not guaranteed to be present in Base metrics.
+        Returns a dict with any of: val/dice_p3, val/dice_p4, val/dice_p5, val/dice_full,
+        plus static training mix ratio keys camtl/ratio_det, camtl/ratio_seg when available.
+        """
+        extras: dict[str, float] = {}
+
+        # 1) Attempt to source per-scale Dice from returned metrics or validator fields.
+        def find_scalar(name: str) -> Optional[float]:
+            # Preferred CSV key
+            for k in (f"val/dice_{name}", f"dice_{name}", f"metrics/seg/dice_{name}", f"seg/dice_{name}"):
+                if k in metrics and metrics[k] is not None:
+                    try:
+                        return float(metrics[k])  # type: ignore[arg-type]
+                    except Exception:
+                        pass
+            # Common validator attributes
+            cand_attrs = ("last_seg_dice", "seg_dice", "dice_scales", "last_dice", "dice")
+            for attr in cand_attrs:
+                obj = getattr(self.validator, attr, None)
+                if isinstance(obj, dict):
+                    for kk in (name, f"dice_{name}"):
+                        if kk in obj and obj[kk] is not None:
+                            try:
+                                return float(obj[kk])
+                            except Exception:
+                                continue
+            return None
+
+        for nm in ("p3", "p4", "p5", "full"):
+            v = find_scalar(nm)
+            if v is not None:
+                extras[f"val/dice_{nm}"] = v
+
+        # 2) Persist det:seg scheduling ratio for reference.
+        try:
+            if hasattr(self, "train_loader") and hasattr(self.train_loader, "ratio"):
+                rx, ry = getattr(self.train_loader, "ratio", (None, None))
+                if rx is not None and ry is not None:
+                    extras["camtl/ratio_det"] = float(rx)
+                    extras["camtl/ratio_seg"] = float(ry)
+        except Exception:
+            pass
+
+        return extras
+
+    def plot_metrics(self) -> None:  # type: ignore[override]
+        """
+        Plot standard Ultralytics metrics, then CAMTL-specific figures if columns exist.
+        """
+
+        #super().plot_metrics()
+        try:
+           self._plot_camtl_metrics()
+        except Exception as e:
+            LOGGER.warning(f"[plot_metrics] CAMTL plotting failed: {e}")
+
+    def _plot_camtl_metrics(self) -> None:
+        """
+        Make CAMTL-specific figures:
+          - results_camtl_dice.png: val/dice_{p3,p4,p5,full} across epochs
+          - results_camtl_losses.png: train/{det,seg,cons,align,l2sp,total} across epochs
+        Uses BaseTrainer.read_results_csv with a builtin CSV fallback.
+        """
+        # Load CSV into dict[str, list]
+        try:
+            table = self.read_results_csv()  # polars-backed, returns dict of lists
+        except Exception:
+            # Fallback light parser
+            table = {}
+            with open(self.csv, "r", encoding="utf-8") as f:
+                reader = csv.reader(f)
+                header = next(reader)
+                cols = [[] for _ in header]
+                for row in reader:
+                    for i, v in enumerate(row):
+                        try:
+                            cols[i].append(float(v))
+                        except Exception:
+                            cols[i].append(float("nan"))
+            table = {h: cols[i] for i, h in enumerate(header)}
+
+        if not table:
+            return
+
+        epochs = table.get("epoch", list(range(1, len(next(iter(table.values()), [])) + 1)))
+
+        # --- Dice per scale figure ---
+        dice_keys = [k for k in ("val/dice_p3", "val/dice_p4", "val/dice_p5", "val/dice_full") if k in table]
+        if dice_keys:
+            plt.figure()
+            for k in dice_keys:
+                plt.plot(epochs, table[k], label=k.replace("val/", ""))
+            plt.xlabel("epoch")
+            plt.ylabel("Dice")
+            plt.title("Per-scale Dice")
+            plt.legend()
+            out = self.save_dir / "results_camtl_dice.png"
+            plt.savefig(out, bbox_inches="tight", dpi=200)
+            plt.close()
+            self.on_plot(str(out))
+
+        # --- Loss components figure ---
+        loss_keys = [k for k in ("train/det", "train/seg", "train/cons", "train/align", "train/l2sp", "train/total") if k in table]
+        if loss_keys:
+            plt.figure()
+            for k in loss_keys:
+                plt.plot(epochs, table[k], label=k.replace("train/", ""))
+            plt.xlabel("epoch")
+            plt.ylabel("loss")
+            plt.title("CAMTL Loss Components")
+            plt.legend()
+            out = self.save_dir / "results_camtl_losses.png"
+            plt.savefig(out, bbox_inches="tight", dpi=200)
+            plt.close()
+            self.on_plot(str(out))
+
+    # ------------------------ Progress String ------------------------ #
 
     def progress_string(self) -> str:  # type: ignore[override]
         names = tuple(self.loss_names) 

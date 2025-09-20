@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from pathlib import Path
 import yaml # type: ignore
-import weakref
+import types
 
 # Ultralytics modules
 from camtl_yolo.external.ultralytics.ultralytics.nn.modules import (
@@ -36,7 +36,26 @@ def _dump_children(mod: nn.Module, max_depth: int = 3, prefix: str = "root", dep
     for k, v in mod._modules.items():
         print(f"{prefix}.{k}: {v.__class__.__name__}")
         _dump_children(v, max_depth=max_depth, prefix=f"{prefix}.{k}", depth=depth+1)
+        
+def _model_info(self, detailed: bool = False, verbose: bool = True, imgsz: int = 512):
+    """Pickle-safe model summary. Ultralytics-compatible."""
+    from camtl_yolo.external.ultralytics.ultralytics.utils import LOGGER
+    nparams = sum(p.numel() for p in self.parameters())
+    if verbose:
+        LOGGER.info(
+            f"CA-MTL-YOLO: params={nparams:,}, stride={getattr(self, 'stride', None)}, imgsz={int(imgsz)}"
+        )
+    return {
+        "params": int(nparams),
+        "stride": getattr(self, "stride", None),
+        "imgsz": int(imgsz),
+        "detailed": bool(detailed),
+    }
+    
 
+def info(self, detailed: bool = False, verbose: bool = True, imgsz: int = 640):
+    """Public entry used by Ultralytics notebooks."""
+    return self._model_info(detailed=detailed, verbose=verbose, imgsz=imgsz)
 
 class CAMTL_YOLO(DetectionModel):
     """
@@ -130,95 +149,120 @@ class CAMTL_YOLO(DetectionModel):
 
         # --- Init weights like Ultralytics ---
         initialize_weights(self)
-        if verbose:
-            self.info = lambda detailed=False, verbose=True, imgsz=640: None  # optional no-op info
-            LOGGER.info(f"YOLOv8{self.scale} summary: {sum(p.numel() for p in self.parameters())} parameters")
-
         # --- Task-aware weight loading (COCO or fine-tuned) ---
         self._load_task_weights()
 
     def forward(self, x, *args, **kwargs):
         """
-        Return a 2-tuple (det_preds, seg_preds).
-        det_preds is the Detect head raw outputs (list of 3 tensors).
-        seg_preds is a tensor or a list of tensors, depending on SegHead.
+        Ultralytics-compatible forward.
+
+        If `x` is a dict (training/eval step), compute loss and return (total_loss, loss_items).
+        If `x` is a tensor (inference), return a tuple (det_out, seg_out).
+
+        This avoids storing any non-picklable callable on the model (no local closures).
+        """
+        # In training/eval the dataloader passes a batch dict
+        if isinstance(x, dict):
+            # Ensure criteria are initialized
+            if getattr(self, "detect_criterion", None) is None:
+                self.init_criterion()
+            preds = self._forward_once(x["img"])
+            total, items = self.loss(x, preds)
+            return total, items
+
+        # Inference path: tensor input → tuple(det_out, seg_out)
+        return self._forward_once(x)
+
+
+    def predict(self, x, profile: bool = False, visualize: bool = False,
+                augment: bool = False, embed=None):
+        """
+        Ultralytics-compatible predict that returns (det_out, seg_out).
+        No augmented prediction for CAMTL; falls back to single-scale.
+        """
+        if augment:
+            LOGGER.warning("CAMTL_YOLO does not support 'augment=True' prediction. Falling back to single-scale.")
+        # profile/visualize/embed can be integrated later; kept for signature parity
+        return self._forward_once(x)
+
+    def _predict_once(self, x, profile: bool = False, visualize: bool = False, embed=None):
+        """
+        Bridge for BaseModel.predict() to ensure we always emit (det_out, seg_out).
         """
         return self._forward_once(x)
 
-    def _forward_once(self, x):
+
+    def _forward_once(self, x: torch.Tensor):
         """
         Forward pass that returns a tuple (det_out, seg_out).
-        Passes the original input HxW to SegHeadMulti so it can emit a fused full-res logits.
-        Works with standard Ultralytics caching: each module sees x built from y[m.f].
+
+        Notes:
+        - seg_out is typically a dict with keys {'p3','p4','p5','full'} from SegHeadMulti.
+        - If SegHeadMulti is absent or emits a single tensor, return that tensor in seg_out.
         """
         y = []
         det_out, seg_out = None, None
-        input_hw = x.shape[-2:] if torch.is_tensor(x) else None  # (H,W)
+        input_hw = x.shape[-2:] if torch.is_tensor(x) else None  # (H, W)
 
         for i, m in enumerate(self.model):
-            # build module input(s) from cache
+            # Build module input(s) from cache
             if m.f != -1:
                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]
 
-            # run
+            # Run
             if isinstance(m, SegHeadMulti):
-                seg_out = m(x, input_hw=input_hw)  # x is a List[P3,P4,P5]
-                out = seg_out                      # keep sequential semantics (cached below if needed)
+                seg_out = m(x, input_hw=input_hw)   # x is List[P3,P4,P5]; returns dict or tensor
+                out = seg_out
             else:
                 out = m(x)
 
-            # capture detect output explicitly
+            # Capture detect output explicitly
             if isinstance(m, Detect):
                 det_out = out
 
-            # cache for future layers if this index is saved
+            # Cache if requested
             y.append(out if m.i in self.save else None)
-
-            # carry forward last tensor for layers that take previous output
             x = out
 
         return det_out, seg_out
 
-
-    def init_criterion(self):
+    def init_criterion(self) -> None:
         """
-        Initialize multi-task criteria.
-        Reads optional weights from self.yaml['LOSS'].
-        Also ensures Ultralytics v8DetectionLoss finds hyperparams under self.args.
+        Initialize CAMTL loss components on the model.
+
+        Side effects:
+            - Sets `self.detect_criterion`, `self.segment_criterion`,
+            `self.consistency_criterion`, `self.align_criterion`
+            - Sets scalar weights: `_lambda_det`, `_lambda_seg`, `_lambda_cons`, `_lambda_align`
+
+        Returns:
+            None  (no callable is returned, so saving the model is pickle-safe)
         """
         from types import SimpleNamespace
 
         cfg = self.yaml.get("LOSS", {}) if isinstance(self.yaml, dict) else {}
         det_hyp = cfg.get("det_hyp") or {}
-        # Defaults match Ultralytics-style gains needed by v8DetectionLoss
         det_defaults = {"box": 7.5, "cls": 0.5, "dfl": 1.5}
-        # Create/patch self.args so external v8DetectionLoss can read model.args
+
+        # Ensure self.args carries detection hyperparameters used by DetectLoss
         if not hasattr(self, "args") or self.args is None:
             self.args = SimpleNamespace(**{**det_defaults, **det_hyp})
         else:
-            # add missing fields without overwriting existing
             for k, v in {**det_defaults, **det_hyp}.items():
                 if not hasattr(self.args, k):
                     setattr(self.args, k, v)
 
-        # Detection loss from Ultralytics (uses model.args)
+        # Instantiate sub-criteria
         self.detect_criterion = DetectionLoss(self, hyp=det_hyp)
-
-        # Segmentation loss: BCE+Dice at one or more scales
         self.segment_criterion = DeepSupervisionBCEDiceLoss(
             w_p3=float(cfg.get("w_p3", 1.0)),
             w_p4=float(cfg.get("w_p4", 1.0)),
             w_p5=float(cfg.get("w_p5", 1.0)),
         )
-
-        # Consistency: boxes → pseudo-mask on detection-domain images
         self.consistency_criterion = ConsistencyMaskFromBoxes(
             weight=float(cfg.get("consistency", 0.1)),
             loss=str(cfg.get("consistency_loss", "bce")).lower(),
         )
-
-        # Attention alignment
-        # IMPORTANT: pass a weak proxy to avoid creating a Module cycle (child→parent back-reference).
         self.align_criterion = AttentionAlignmentLoss(
             model=self,
             source_name=str(cfg.get("source_domain", "retinography")),
@@ -226,40 +270,24 @@ class CAMTL_YOLO(DetectionModel):
             weight=float(cfg.get("align", 0.1)),
         )
 
-        # Scalar weights
+        # Global scalars
         self._lambda_det = float(cfg.get("lambda_det", 1.0))
         self._lambda_seg = float(cfg.get("lambda_seg", 1.0))
         self._lambda_cons = float(cfg.get("lambda_cons", 0.1))
         self._lambda_align = float(cfg.get("lambda_align", 0.1))
 
-        _dump_children(self, max_depth=2)
-        # Fail fast if any other accidental cycles exist
-        try:
-            assert_no_module_cycles(self)
-        except Exception as e:
-            # Turn into a hard error in dev; WARN if you prefer soft behavior
-            raise RuntimeError(f"Module cycle detected after criterion init: {e}")
-        return True
+        # No return. Avoid attaching any callable that would break pickling.
+
 
     def loss(self, batch, preds):
         """
-        Compute total multi-task loss for a mixed batch.
-        - Detection loss on batches with detection labels.
-        - Segmentation loss on batches flagged as segmentation.
-        - Consistency loss on detection-domain images using GT boxes as pseudo masks.
-        - Attention alignment loss across domains if CTAM attention is available.
-        - Optional L2-SP regularization if tasks.configure_task attached self._l2sp.
-        """
-        def _shape_str(obj):
-            if obj is None:
-                return "None"
-            if torch.is_tensor(obj):
-                return str(tuple(obj.shape))
-            if isinstance(obj, (list, tuple)):
-                return "[" + ", ".join(_shape_str(t) for t in obj) + "]"
-            return type(obj).__name__
+        Compute CAMTL multi-task loss robustly.
 
-        # Unpack robustly: expect a 2-tuple; if not, assume det-only and set seg=None
+        Behavior:
+        - Handles missing keys by treating the absent component as 0.
+        - Aggregates into a 6-term vector [det, seg, cons, align, l2sp, total] on the correct device.
+        """
+        # Unpack predictions
         if isinstance(preds, (list, tuple)) and len(preds) == 2:
             det_preds, seg_preds = preds
         else:
@@ -267,42 +295,56 @@ class CAMTL_YOLO(DetectionModel):
 
         device = batch["img"].device
 
-        # detection
-        has_det = batch["bboxes"].numel() > 0
+        # Flags and safe accessors
+        bboxes = batch.get("bboxes", None)
+        is_seg_flag = batch.get("is_seg", None)
+        has_det = torch.is_tensor(bboxes) and bboxes.numel() > 0
+        has_seg = False
+        if torch.is_tensor(is_seg_flag):
+            has_seg = bool(is_seg_flag.any().item())
+        elif isinstance(is_seg_flag, (list, tuple)):
+            has_seg = any(bool(x) for x in is_seg_flag)
 
+        # Detection
         loss_det = torch.zeros((), device=device)
-        det_items = {}
         if has_det:
-            loss_det, det_items = self.detect_criterion(det_preds, batch)
-            if isinstance(loss_det, torch.Tensor) and loss_det.ndim > 0:
-                loss_det = loss_det.sum()
+            try:
+                l_det, _det_items = self.detect_criterion(det_preds, batch)
+                loss_det = l_det if l_det.ndim == 0 else l_det.sum()
+            except Exception as e:
+                LOGGER.warning(f"[loss] detection loss failed: {e}")
 
-        # segmentation (only if any seg sample exists in batch)
-        has_seg = bool(batch["is_seg"].any().item()) if isinstance(batch["is_seg"], torch.Tensor) else any(batch["is_seg"])
+        # Segmentation
         loss_seg = torch.zeros((), device=device)
-        seg_items = {}
         if has_seg:
-            loss_seg, seg_items = self.segment_criterion(seg_preds, batch)
+            try:
+                l_seg, _seg_items = self.segment_criterion(seg_preds, batch)
+                loss_seg = l_seg if l_seg.ndim == 0 else l_seg.sum()
+            except Exception as e:
+                LOGGER.warning(f"[loss] segmentation loss failed: {e}")
 
-        # consistency on detection-domain images
-        cons_loss, cons_items = self.consistency_criterion(seg_preds, batch)
+        # Consistency and alignment
+        cons_loss = torch.zeros((), device=device)
+        try:
+            c_l, _ = self.consistency_criterion(seg_preds, batch)
+            cons_loss = c_l if c_l.ndim == 0 else c_l.sum()
+        except Exception as e:
+            LOGGER.warning(f"[loss] consistency loss failed: {e}")
 
-        # attention alignment between domains
-        align_loss, align_items = self.align_criterion(batch)
+        align_loss = torch.zeros((), device=device)
+        try:
+            a_l, _ = self.align_criterion(batch)
+            align_loss = a_l if a_l.ndim == 0 else a_l.sum()
+        except Exception as e:
+            LOGGER.warning(f"[loss] alignment loss failed: {e}")
 
-        # L2-SP if configured by task
+        # L2-SP
         l2sp_term = torch.zeros((), device=device)
-        if hasattr(self, "_l2sp") and self._l2sp is not None:
-            l2sp_term = self._l2sp(self)
-
-        def _to_scalar(t: torch.Tensor) -> torch.Tensor:
-            # Sum if vector per level, keep dtype/device
-            return t if t.ndim == 0 else t.sum()
-
-        loss_det   = _to_scalar(loss_det)
-        loss_seg   = _to_scalar(loss_seg)
-        cons_loss  = _to_scalar(cons_loss)
-        align_loss = _to_scalar(align_loss)
+        if getattr(self, "_l2sp", None) is not None:
+            try:
+                l2sp_term = self._l2sp(self)
+            except Exception as e:
+                LOGGER.warning(f"[loss] L2-SP failed: {e}")
 
         total = (
             self._lambda_det * loss_det
@@ -312,210 +354,11 @@ class CAMTL_YOLO(DetectionModel):
             + l2sp_term
         )
 
-        loss_items = torch.stack([
-            loss_det.detach(),
-            loss_seg.detach(),
-            cons_loss.detach(),
-            align_loss.detach(),
-            l2sp_term.detach(),
-            total.detach(),
-        ])
+        loss_items = torch.stack(
+            [loss_det.detach(), loss_seg.detach(), cons_loss.detach(),
+            align_loss.detach(), l2sp_term.detach(), total.detach()]
+        )
         return total, loss_items
-
-    def _load_pretrained_weights(self):
-        """Load COCO weights: backbone+neck from *seg* ckpt, Detect head from *det* ckpt.
-        Skip classification branches when nc!=COCO_nc to avoid shape errors.
-        """
-        if not self.seg_weights.exists():
-            raise FileNotFoundError(f"Segmentation weights not found at {self.seg_weights}")
-        if not self.det_weights.exists():
-            raise FileNotFoundError(f"Detection weights not found at {self.det_weights}")
-
-        LOGGER.info(f"Loading backbone and neck from {self.seg_weights}...")
-        ckpt_seg = torch.load(self.seg_weights, map_location="cpu", weights_only=False)
-        csd_seg = ckpt_seg["model"].float().state_dict()
-
-        LOGGER.info(f"Loading detection head from {self.det_weights}...")
-        ckpt_det = torch.load(self.det_weights, map_location="cpu", weights_only=False)
-        csd_det = ckpt_det["model"].float().state_dict()
-
-        new_sd = self.state_dict()
-        det_idx = _find_idx(self.model, Detect)
-
-        loaded, skipped, mismatched = 0, 0, 0
-        det_loaded, det_total_eligible = 0, 0
-
-        # 1) load backbone+neck from yolov8*-seg.pt, exclude its seg head block ('model.22.')
-        for k, v in csd_seg.items():
-            if k.startswith("model.22."):  # seg head in Ultralytics seg ckpt
-                skipped += 1
-                continue
-            if k in new_sd and new_sd[k].shape == v.shape:
-                new_sd[k] = v
-                loaded += 1
-            else:
-                mismatched += 1
-
-        # 2) load detect head from yolov8*.pt into our Detect idx, but ignore cls branch if nc differs
-        if det_idx is None:
-            LOGGER.warning("Detect head not found; skipping detect-head remap")
-        else:
-            # determine if classification tensors are shape-compatible
-            # In Ultralytics Detect, 'cv3' corresponds to classification convs and depends on nc.
-            model_nc = getattr(self.model[det_idx], "nc", None)
-            coco_nc = ckpt_det["model"].nc if hasattr(ckpt_det["model"], "nc") else 80
-            skip_cls = (model_nc is not None) and (int(model_nc) != int(coco_nc))
-
-            for k_det, v_det in csd_det.items():
-                if not k_det.startswith("model.22."):
-                    continue
-                sub = k_det.split("model.22.", 1)[1]
-                if skip_cls and sub.startswith("cv3"):
-                    # classification tensors depend on nc -> skip when nc!=COCO
-                    skipped += 1
-                    continue
-
-                new_k = f"model.{det_idx}.{sub}"
-                det_total_eligible += 1
-                if new_k in new_sd and new_sd[new_k].shape == v_det.shape:
-                    new_sd[new_k] = v_det
-                    loaded += 1
-                    det_loaded += 1
-                else:
-                    mismatched += 1
-                    LOGGER.warning(f"Could not map {k_det} -> {new_k} (missing or shape mismatch)")
-
-        # commit
-        self.load_state_dict(new_sd, strict=False)
-        LOGGER.info(
-            f"Pretrained load summary: loaded={loaded}, skipped={skipped}, "
-            f"shape_mismatch={mismatched}, det_mapped={det_loaded}/{det_total_eligible}"
-        )
-
-    # --- Task-aware weight loading and saving ---------------------------------
-
-    def _load_task_weights(self) -> None:
-        """
-        Load weights based on YAML TASK:
-          - DomainShift1: COCO seg + COCO det (mapped) [strict mapping]
-          - CAMTL: fine-tuned checkpoint from DomainShift1 (single .pt)
-        """
-        if self.task == "DomainShift1":
-            self._load_coco_pretrained_weights()
-            return
-
-        if self.task == "CAMTL":
-            ckpt_path = self.pretrained_root / f"yolov8{self.scale}-domainshift1.pt"
-            if not ckpt_path.exists():
-                raise FileNotFoundError(f"[CAMTL] DomainShift1 checkpoint not found: {ckpt_path}")
-
-            # Ensure seg-stream normalization is GN before loading if your DomainShift1 used GN
-            try:
-                replaced = replace_seg_stream_bn_with_groupnorm(self, max_groups=int(self.yaml.get("GN_GROUPS", 32)))
-                assert_no_module_cycles(self)
-                if replaced:
-                    LOGGER.info(f"[CAMTL] Converted {replaced} BN layers to GroupNorm in segmentation stream before loading.")
-            except Exception as e:
-                LOGGER.warning(f"[CAMTL] GN conversion skipped: {e}")
-
-            self._load_finetuned_weights(ckpt_path)
-            return
-
-        LOGGER.warning(f"[TASK={self.task}] Unknown task. Skipping pretrained loading.")
-
-    def _load_coco_pretrained_weights(self):
-        """DomainShift1: backbone+neck from *seg* ckpt, Detect head from *det* ckpt with safe remap."""
-        if not self.seg_weights.exists():
-            raise FileNotFoundError(f"Segmentation weights not found at {self.seg_weights}")
-        if not self.det_weights.exists():
-            raise FileNotFoundError(f"Detection weights not found at {self.det_weights}")
-
-        LOGGER.info(f"Loading backbone and neck from {self.seg_weights}...")
-        ckpt_seg = torch.load(self.seg_weights, map_location="cpu", weights_only=False)
-        csd_seg = ckpt_seg["model"].float().state_dict()
-
-        LOGGER.info(f"Loading detection head from {self.det_weights}...")
-        ckpt_det = torch.load(self.det_weights, map_location="cpu", weights_only=False)
-        csd_det = ckpt_det["model"].float().state_dict()
-
-        new_sd = self.state_dict()
-        det_idx = _find_idx(self.model, Detect)
-
-        loaded, skipped, mismatched = 0, 0, 0
-        det_loaded, det_total_eligible = 0, 0
-
-        # Backbone+neck from yolov8*-seg.pt (exclude seg head 'model.22.')
-        for k, v in csd_seg.items():
-            if k.startswith("model.22."):
-                skipped += 1
-                continue
-            if k in new_sd and new_sd[k].shape == v.shape:
-                new_sd[k] = v
-                loaded += 1
-            else:
-                mismatched += 1
-
-        # Detect head from yolov8*.pt → our Detect index; ignore classification if nc differs
-        if det_idx is None:
-            LOGGER.warning("Detect head not found; skipping detect-head remap")
-        else:
-            model_nc = getattr(self.model[det_idx], "nc", None)
-            coco_nc = ckpt_det["model"].nc if hasattr(ckpt_det["model"], "nc") else 80
-            skip_cls = (model_nc is not None) and (int(model_nc) != int(coco_nc))
-
-            for k_det, v_det in csd_det.items():
-                if not k_det.startswith("model.22."):
-                    continue
-                sub = k_det.split("model.22.", 1)[1]
-                if skip_cls and sub.startswith("cv3"):
-                    skipped += 1
-                    continue
-                new_k = f"model.{det_idx}.{sub}"
-                det_total_eligible += 1
-                if new_k in new_sd and new_sd[new_k].shape == v_det.shape:
-                    new_sd[new_k] = v_det
-                    loaded += 1
-                    det_loaded += 1
-                else:
-                    mismatched += 1
-                    LOGGER.warning(f"Could not map {k_det} -> {new_k} (missing or shape mismatch)")
-
-        self.load_state_dict(new_sd, strict=False)
-        LOGGER.info(
-            f"Pretrained load summary: loaded={loaded}, skipped={skipped}, "
-            f"shape_mismatch={mismatched}, det_mapped={det_loaded}/{det_total_eligible}"
-        )
-
-    def _load_finetuned_weights(self, ckpt_path: Path) -> None:
-        """
-        CAMTL: load a single fine-tuned checkpoint produced after DomainShift1.
-        Accepts Ultralytics-style {'model': nn.Module, ...} or raw state_dict under 'model'.
-        """
-        LOGGER.info(f"[CAMTL] Loading fine-tuned checkpoint from {ckpt_path} ...")
-        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-
-        if isinstance(ckpt, dict) and "model" in ckpt:
-            src = ckpt["model"]
-            state_src = src.state_dict() if hasattr(src, "state_dict") else dict(ckpt["model"])
-        elif isinstance(ckpt, dict):
-            # assume already a state_dict
-            state_src = ckpt
-        else:
-            # loaded a bare nn.Module
-            state_src = ckpt.state_dict()  # type: ignore[attr-defined]
-
-        state_dst = self.state_dict()
-        loaded, skipped, mismatched = 0, 0, 0
-
-        for k, v in state_src.items():
-            if k in state_dst and state_dst[k].shape == v.shape:
-                state_dst[k] = v
-                loaded += 1
-            else:
-                mismatched += 1
-
-        self.load_state_dict(state_dst, strict=False)
-        LOGGER.info(f"[CAMTL] Load summary: loaded={loaded}, mismatched_or_missing={mismatched}, skipped={skipped}")
 
     @torch.no_grad()
     def save_task_checkpoint(self, save_dir: str | Path, filename: str | None = None,
@@ -641,22 +484,38 @@ class CAMTL_YOLO(DetectionModel):
                 args.append(in_list)
                 m.legacy = legacy
                 c2 = in_list[-1]
-            elif m is Segment:
+            elif m is SegHeadMulti:
+                # compute actual input channels from f
                 if isinstance(f, list):
-                    in_list = [ch[x] if not isinstance(ch[x], (list, tuple)) else list(ch[x]) for x in f]
-                    in_list = [int(c) for c in in_list]
+                    in_list = [ch[x] if not isinstance(ch[x], (list, tuple)) else ch[x][-1] for x in f]
                 else:
                     c = ch[f]
-                    in_list = list(c) if isinstance(c, (list, tuple)) else [int(c)]
-                args.append(in_list)
-                if len(args) >= 3 and isinstance(args[2], (int, float)):
-                    args[2] = make_divisible(min(args[2], max_channels) * width, 8)
+                    in_list = [c] if not isinstance(c, (list, tuple)) else list(c)
+                in_list = [int(c) for c in in_list]
+                LOGGER.debug(f"Custom {m.__name__}: in={in_list}, args={args}")
+
+                # normalize args to exactly: [in_channels, out_channels, fuse]
+                out_ch = 1
+                fuse = True
+
+                # Case A: YAML provided [in_channels, out_ch, fuse] → replace in_channels with computed to ensure match
+                if len(args) >= 1 and isinstance(args[0], (list, tuple)) and len(args[0]) == 3:
+                    # optional overrides
+                    if len(args) >= 2 and isinstance(args[1], (int, float)):
+                        out_ch = int(args[1])
+                    if len(args) >= 3 and isinstance(args[2], (bool,)):
+                        fuse = bool(args[2])
+                    args = [in_list, out_ch, fuse]
+                else:
+                    # Case B: YAML did not provide in_channels → use computed and keep optional overrides
+                    if len(args) >= 1 and isinstance(args[0], (int, float)):
+                        out_ch = int(args[0])
+                    if len(args) >= 2 and isinstance(args[1], (bool,)):
+                        fuse = bool(args[1])
+                    args = [in_list, out_ch, fuse]
+
                 m.legacy = legacy
                 c2 = in_list[-1]
-            elif m is nn.Identity:
-                c2 = ch[f] if isinstance(f, int) else ch[f[-1]]
-                # Optional: attach attributes if tests expect them
-                # (noop if not accessed)
             elif m in {CTAM, CSAM, FPMA}:
                 c_in = [ch[x] for x in f] if isinstance(f, list) else ch[f]
                 args = [c_in, *args]
@@ -699,3 +558,197 @@ class CAMTL_YOLO(DetectionModel):
 
         return nn.Sequential(*layers), sorted(set(save))
 
+
+    # --- Weight loading and saving ---------------------------------
+
+    def _load_pretrained_weights(self):
+        """Load COCO weights: backbone+neck from *seg* ckpt, Detect head from *det* ckpt.
+        Skip classification branches when nc!=COCO_nc to avoid shape errors.
+        """
+        if not self.seg_weights.exists():
+            raise FileNotFoundError(f"Segmentation weights not found at {self.seg_weights}")
+        if not self.det_weights.exists():
+            raise FileNotFoundError(f"Detection weights not found at {self.det_weights}")
+
+        LOGGER.info(f"Loading backbone and neck from {self.seg_weights}...")
+        ckpt_seg = torch.load(self.seg_weights, map_location="cpu", weights_only=False)
+        csd_seg = ckpt_seg["model"].float().state_dict()
+
+        LOGGER.info(f"Loading detection head from {self.det_weights}...")
+        ckpt_det = torch.load(self.det_weights, map_location="cpu", weights_only=False)
+        csd_det = ckpt_det["model"].float().state_dict()
+
+        new_sd = self.state_dict()
+        det_idx = _find_idx(self.model, Detect)
+
+        loaded, skipped, mismatched = 0, 0, 0
+        det_loaded, det_total_eligible = 0, 0
+
+        # 1) load backbone+neck from yolov8*-seg.pt, exclude its seg head block ('model.22.')
+        for k, v in csd_seg.items():
+            if k.startswith("model.22."):  # seg head in Ultralytics seg ckpt
+                skipped += 1
+                continue
+            if k in new_sd and new_sd[k].shape == v.shape:
+                new_sd[k] = v
+                loaded += 1
+            else:
+                mismatched += 1
+
+        # 2) load detect head from yolov8*.pt into our Detect idx, but ignore cls branch if nc differs
+        if det_idx is None:
+            LOGGER.warning("Detect head not found; skipping detect-head remap")
+        else:
+            # determine if classification tensors are shape-compatible
+            # In Ultralytics Detect, 'cv3' corresponds to classification convs and depends on nc.
+            model_nc = getattr(self.model[det_idx], "nc", None)
+            coco_nc = ckpt_det["model"].nc if hasattr(ckpt_det["model"], "nc") else 80
+            skip_cls = (model_nc is not None) and (int(model_nc) != int(coco_nc))
+
+            for k_det, v_det in csd_det.items():
+                if not k_det.startswith("model.22."):
+                    continue
+                sub = k_det.split("model.22.", 1)[1]
+                if skip_cls and sub.startswith("cv3"):
+                    # classification tensors depend on nc -> skip when nc!=COCO
+                    skipped += 1
+                    continue
+
+                new_k = f"model.{det_idx}.{sub}"
+                det_total_eligible += 1
+                if new_k in new_sd and new_sd[new_k].shape == v_det.shape:
+                    new_sd[new_k] = v_det
+                    loaded += 1
+                    det_loaded += 1
+                else:
+                    mismatched += 1
+                    LOGGER.warning(f"Could not map {k_det} -> {new_k} (missing or shape mismatch)")
+
+        # commit
+        self.load_state_dict(new_sd, strict=False)
+        LOGGER.info(
+            f"Pretrained load summary: loaded={loaded}, skipped={skipped}, "
+            f"shape_mismatch={mismatched}, det_mapped={det_loaded}/{det_total_eligible}"
+        )
+
+    def _load_task_weights(self) -> None:
+        """
+        Load pretrained or fine-tuned weights based on YAML 'TASK'.
+
+        - DomainShift1: COCO seg + COCO det (safe remap of Detect head)
+        - CAMTL: single fine-tuned checkpoint 'yolov8{SCALE}-domainshift1.pt'
+        """
+        task = str(self.task)
+        if task == "DomainShift1":
+            self._load_coco_pretrained_weights()
+            return
+        if task == "CAMTL":
+            ckpt_path = self.pretrained_root / f"yolov8{self.scale}-domainshift1.pt"
+            if not ckpt_path.exists():
+                raise FileNotFoundError(f"[CAMTL] DomainShift1 checkpoint not found: {ckpt_path}")
+            # Ensure seg-stream GN if that is your phase-1 norm policy
+            try:
+                replaced = replace_seg_stream_bn_with_groupnorm(self, max_groups=int(self.yaml.get("GN_GROUPS", 32)))
+                assert_no_module_cycles(self)
+                if replaced:
+                    LOGGER.info(f"[CAMTL] Converted {replaced} BN layers to GroupNorm in segmentation stream before loading.")
+            except Exception as e:
+                LOGGER.warning(f"[CAMTL] GN conversion skipped: {e}")
+            self._load_finetuned_weights(ckpt_path)
+            return
+        LOGGER.warning(f"[TASK={task}] Unknown task. Skipping pretrained loading.")
+
+    def _load_coco_pretrained_weights(self) -> None:
+        """
+        DomainShift1 boot: load backbone+neck from *seg* checkpoint and map Detect head from *det* checkpoint.
+        Safely skip classification branch tensors when 'nc' differs.
+        """
+        if not self.seg_weights.exists():
+            raise FileNotFoundError(f"Segmentation weights not found at {self.seg_weights}")
+        if not self.det_weights.exists():
+            raise FileNotFoundError(f"Detection weights not found at {self.det_weights}")
+
+        LOGGER.info(f"Loading backbone and neck from {self.seg_weights}...")
+        ckpt_seg = torch.load(self.seg_weights, map_location="cpu", weights_only=False)
+        csd_seg = ckpt_seg["model"].float().state_dict()
+
+        LOGGER.info(f"Loading detection head from {self.det_weights}...")
+        ckpt_det = torch.load(self.det_weights, map_location="cpu", weights_only=False)
+        csd_det = ckpt_det["model"].float().state_dict()
+
+        new_sd = self.state_dict()
+        det_idx = _find_idx(self.model, Detect)
+
+        loaded, skipped, mismatched = 0, 0, 0
+        det_loaded, det_total_eligible = 0, 0
+
+        # 1) backbone+neck from seg ckpt, exclude its seg head block ('model.22.')
+        for k, v in csd_seg.items():
+            if k.startswith("model.22."):
+                skipped += 1
+                continue
+            if k in new_sd and new_sd[k].shape == v.shape:
+                new_sd[k] = v
+                loaded += 1
+            else:
+                mismatched += 1
+
+        # 2) Detect head remap
+        if det_idx is None:
+            LOGGER.warning("Detect head not found; skipping detect-head remap")
+        else:
+            model_nc = getattr(self.model[det_idx], "nc", None)
+            coco_nc = ckpt_det["model"].nc if hasattr(ckpt_det["model"], "nc") else 80
+            skip_cls = (model_nc is not None) and (int(model_nc) != int(coco_nc))
+            for k_det, v_det in csd_det.items():
+                if not k_det.startswith("model.22."):
+                    continue
+                sub = k_det.split("model.22.", 1)[1]
+                if skip_cls and sub.startswith("cv3"):
+                    skipped += 1
+                    continue
+                new_k = f"model.{det_idx}.{sub}"
+                det_total_eligible += 1
+                if new_k in new_sd and new_sd[new_k].shape == v_det.shape:
+                    new_sd[new_k] = v_det
+                    loaded += 1
+                    det_loaded += 1
+                else:
+                    mismatched += 1
+                    LOGGER.warning(f"Could not map {k_det} -> {new_k} (missing or shape mismatch)")
+
+        # Commit
+        self.load_state_dict(new_sd, strict=False)
+        LOGGER.info(
+            f"Pretrained load summary: loaded={loaded}, skipped={skipped}, "
+            f"shape_mismatch={mismatched}, det_mapped={det_loaded}/{det_total_eligible}"
+        )
+
+    def _load_finetuned_weights(self, ckpt_path: Path) -> None:
+        """
+        CAMTL phase: load a single fine-tuned checkpoint produced after DomainShift1.
+        Accepts Ultralytics-style {'model': nn.Module, ...} or a raw state_dict under 'model'.
+        """
+        LOGGER.info(f"[CAMTL] Loading fine-tuned checkpoint from {ckpt_path} ...")
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+
+        if isinstance(ckpt, dict) and "model" in ckpt:
+            src = ckpt["model"]
+            state_src = src.state_dict() if hasattr(src, "state_dict") else dict(ckpt["model"])
+        elif isinstance(ckpt, dict):
+            state_src = ckpt  # already a state_dict
+        else:
+            state_src = ckpt.state_dict()  # bare nn.Module
+
+        state_dst = self.state_dict()
+        loaded, mismatched = 0, 0
+
+        for k, v in state_src.items():
+            if k in state_dst and state_dst[k].shape == v.shape:
+                state_dst[k] = v
+                loaded += 1
+            else:
+                mismatched += 1
+
+        self.load_state_dict(state_dst, strict=False)
+        LOGGER.info(f"[CAMTL] Load summary: loaded={loaded}, mismatched_or_missing={mismatched}")

@@ -62,47 +62,84 @@ class ConsistencyMaskFromBoxes(nn.Module):
 
     def forward(
         self,
-        seg_preds: Union[torch.Tensor, Sequence[torch.Tensor]],
+        seg_preds: Union[torch.Tensor, Sequence[torch.Tensor], Dict[str, torch.Tensor]],
         batch: Dict[str, torch.Tensor | list],
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
-        seg_preds : Tensor [B,1,H,W] or list of Tensors (any scales). We use the highest resolution.
-        batch : needs keys img [B,3,H,W], bboxes [M,4] xywh, batch_idx [M], is_seg [B]
+        seg_preds:
+            - logits Tensor [B,1,H,W], or
+            - list/tuple of logits at various scales, or
+            - dict from SegHeadMulti with keys like {'p3','p4','p5','full'} (logits).
+        We use 'full' if available, else the largest spatial tensor.
+
+        batch: needs keys 'img' [B,3,H,W], 'bboxes' [M,4] xywh, 'batch_idx' [M], 'is_seg' [B]
         """
-        preds_list: List[torch.Tensor] = [seg_preds] if isinstance(seg_preds, torch.Tensor) else list(seg_preds)
-        # pick finest resolution
-        preds_list.sort(key=lambda t: t.shape[-1] * t.shape[-2], reverse=True)
-        pred = preds_list[0]
+        # --- pick prediction tensor ---
+        if isinstance(seg_preds, dict):
+            if "full" in seg_preds and torch.is_tensor(seg_preds["full"]):
+                preds_list = [seg_preds["full"]]
+            else:
+                preds_list = [v for v in seg_preds.values() if torch.is_tensor(v)]
+        elif isinstance(seg_preds, (list, tuple)):
+            preds_list = [t for t in seg_preds if torch.is_tensor(t)]
+        elif torch.is_tensor(seg_preds):
+            preds_list = [seg_preds]
+        else:
+            raise TypeError(f"Unsupported seg_preds type: {type(seg_preds)}")
+
+        if not preds_list:
+            # nothing to align
+            z = torch.zeros((), device=batch["img"].device)
+            return z, {"cons_loss": z}
+
+        # ensure 4D and pick highest resolution
+        preds_list = [t if t.ndim == 4 else t.unsqueeze(1) for t in preds_list]
+        preds_list.sort(key=lambda t: int(t.shape[-1]) * int(t.shape[-2]), reverse=True)
+        pred = preds_list[0]  # logits
         B, _, H, W = pred.shape
         device = pred.device
 
-        # select images coming from detection domain (is_seg == False)
-        is_seg = batch["is_seg"].to(device=device)
-        det_mask = (~is_seg).to(torch.bool)
+        # --- select detection-domain images ---
+        is_seg_raw = batch.get("is_seg", None)
+        if isinstance(is_seg_raw, torch.Tensor):
+            is_seg = is_seg_raw.to(device=device, dtype=torch.bool)
+        else:
+            is_seg = torch.as_tensor(is_seg_raw, device=device, dtype=torch.bool)
+        det_mask = ~is_seg
         if det_mask.sum() == 0:
-            return torch.zeros((), device=device), {"cons_loss": torch.zeros((), device=device)}
+            z = torch.zeros((), device=device)
+            return z, {"cons_loss": z}
 
-        boxes = batch["bboxes"].to(device=device)
-        bi = batch["batch_idx"].to(device=device)
-        # build pseudo mask and restrict to detection images only
-        pseudo = _boxes_to_masks(boxes, bi, B=B, H=H, W=W)
+        # --- boxes and per-image presence ---
+        boxes = batch["bboxes"].to(device=device) if batch["bboxes"].numel() else torch.zeros((0, 4), device=device)
+        bi = batch["batch_idx"].to(device=device) if batch["batch_idx"].numel() else torch.zeros((0,), dtype=torch.long, device=device)
 
-        # mask out non-detection images from loss by zeroing targets and predictions contribution
-        # keep computation over full batch to avoid index gymnastics
-        det_mask_4d = det_mask.view(B, 1, 1, 1).float()
-        pseudo = pseudo * det_mask_4d
-        pred_logits = pred  # expect logits
+        # pseudo-mask at pred resolution
+        pseudo = _boxes_to_masks(boxes, bi, B=B, H=H, W=W)  # [B,1,H,W]
 
+        has_box = torch.zeros(B, dtype=torch.bool, device=device)
+        if bi.numel():
+            has_box.scatter_(0, bi.clamp_min(0).clamp_max(B - 1), True)
+
+        eff = det_mask & has_box  # effective images: detection domain and with boxes
+        if not eff.any():
+            z = torch.zeros((), device=device)
+            return z, {"cons_loss": z}
+
+        eff4 = eff.view(B, 1, 1, 1).float()
+        pred_logits = pred * eff4
+        pseudo = pseudo * eff4
+
+        # --- loss ---
         if self.use_bce:
             loss_raw = self.bce(pred_logits, pseudo)
         else:
             prob = torch.sigmoid(pred_logits)
-            # Dice on detection images only
             eps = 1e-6
-            inter = torch.sum(prob * pseudo, dim=(1, 2, 3))
-            denom = torch.sum(prob, dim=(1, 2, 3)) + torch.sum(pseudo, dim=(1, 2, 3)) + eps
+            inter = (prob * pseudo).sum(dim=(1, 2, 3))
+            denom = prob.sum(dim=(1, 2, 3)) + pseudo.sum(dim=(1, 2, 3)) + eps
             dice = (2.0 * inter + eps) / denom
-            loss_raw = (1.0 - dice[det_mask]).mean() if det_mask.any() else torch.zeros((), device=device)
+            loss_raw = (1.0 - dice[eff]).mean()
 
         loss = self.weight * loss_raw
         return loss, {"cons_loss": loss.detach()}
