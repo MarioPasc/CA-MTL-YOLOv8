@@ -392,7 +392,7 @@ class CAMTLValidator(BaseValidator):
         except Exception as e:
             LOGGER.debug(f"[CAMTLValidator] reading results/args failed: {e}")
             return
-        LOGGER.info(f"Current epoch from CSV: {current_epoch}, total epochs from args: {total_epochs}")
+        LOGGER.debug(f"Current epoch from CSV: {current_epoch}, total epochs from args: {total_epochs}")
         tps = set(int(x) for x in self._timepoints(total_epochs).tolist())
         epoch_1based = int(current_epoch + 1)
 
