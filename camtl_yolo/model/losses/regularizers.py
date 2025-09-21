@@ -23,25 +23,28 @@ class L2SPRegularizer:
             for k, v in list(self.ref.items()):
                 self.ref[k] = v.to(self.device)
 
+    __slots__ = ("anchors", "lam")
+
+    def __init__(self, anchors: dict[str, torch.Tensor], lam: float) -> None:
+        # store CPU copies to keep checkpoints portable; move to device at use-time
+        self.anchors = {k: v.detach().cpu() for k, v in anchors.items()}
+        self.lam = float(lam)
+
     def __call__(self, model: nn.Module) -> torch.Tensor:
-        if self.weight <= 0.0:
-            p0 = next(model.parameters())
-            return torch.zeros((), device=p0.device)
-        total = None
-        for name, p in model.named_parameters():
-            if not p.requires_grad:
+        if self.lam <= 0.0 or not self.anchors:
+            # return a scalar 0 on the model's device
+            dev = next(model.parameters()).device
+            return torch.zeros((), device=dev)
+        cur = dict(model.named_parameters())
+        dev = next(model.parameters()).device
+        loss = torch.zeros((), device=dev, dtype=torch.float32)
+        for n, ref_cpu in self.anchors.items():
+            p = cur.get(n, None)
+            if p is None or not p.requires_grad:
                 continue
-            if self.include is not None and not self.include(name, p):
-                continue
-            ref_w = self.ref.get(name)
-            if ref_w is None or ref_w.shape != p.shape:
-                continue
-            diff = (p - ref_w.to(p.device)) ** 2
-            total = diff.sum() if total is None else (total + diff.sum())
-        if total is None:
-            p0 = next(model.parameters())
-            return torch.zeros((), device=p0.device)
-        return self.weight * total
+            ref = ref_cpu.to(device=p.device, dtype=p.dtype)
+            loss = loss + torch.sum((p.float() - ref.float()) ** 2)
+        return loss * self.lam
 
 
 @torch.no_grad()
