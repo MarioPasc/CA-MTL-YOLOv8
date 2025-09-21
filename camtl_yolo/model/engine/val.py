@@ -11,6 +11,7 @@ import contextlib
 
 import numpy as np
 import os
+import pandas as pd # type: ignore
 
 import torch
 import torch.nn as nn
@@ -19,6 +20,7 @@ import torch.nn.functional as F
 from camtl_yolo.model.utils.normalization import set_bn_domain
 from camtl_yolo.model.utils.samplers import map_domain_name
 from camtl_yolo.model.utils.plotting import make_final_camtl_viz
+from camtl_yolo.model.utils.metrics import dice
 from camtl_yolo.external.ultralytics.ultralytics.engine.validator import BaseValidator
 from camtl_yolo.external.ultralytics.ultralytics.utils import LOGGER, TQDM
 from camtl_yolo.external.ultralytics.ultralytics.utils.ops import Profile
@@ -46,14 +48,9 @@ class CAMTLValidator(BaseValidator):
                 "val/align",
                 "val/l2sp",
                 "val/total",
-                "val/dice",
-                "val/dice_p3",
-                "val/dice_p4",
-                "val/dice_p5",
-                "val/dice_full",
             ]
         )
-        # Dice accumulators (initialized later)
+        # Removed Dice accumulators: no Dice metrics are computed during validation
         self._dice_sums: Dict[str, float] = {}
         self._dice_counts: Dict[str, int] = {}
         # ---- prediction & feature-map capture state ----
@@ -95,205 +92,6 @@ class CAMTLValidator(BaseValidator):
         """
         return preds
 
-    def init_metrics(self, model: nn.Module) -> None:
-        """
-        Initialize counters and per-scale accumulators.
-        """
-        self.names = getattr(model, "names", {0: "object"})
-        self.nc = len(self.names) if isinstance(self.names, (list, dict)) else 1
-
-        # For BaseValidator compatibility
-        self.seen = 0
-        self.batch_i = 0
-
-        # Per-component loss totals (averaged at the end)
-        self._sum_det = 0.0
-        self._sum_seg = 0.0
-        self._sum_cons = 0.0
-        self._sum_align = 0.0
-        self._sum_l2sp = 0.0
-        self._cnt_det = 0
-        self._cnt_seg = 0
-
-        # Dice accumulators
-        self._dice_sums = {"p3": 0.0, "p4": 0.0, "p5": 0.0, "full": 0.0}
-        self._dice_counts = {"p3": 0, "p4": 0, "p5": 0, "full": 0}
-
-    def update_metrics(self, preds: Any, batch: Mapping[str, Any]) -> None:
-        """
-        Standard accumulation plus timepointed saving. Only rank-0 and only batch 0.
-        Saves under:
-            val_preds_fm/epoch_{k}/feature_maps/
-            val_preds_fm/epoch_{k}/segment/   (seg panel)
-            val_preds_fm/epoch_{k}/detect/    (det overlay)
-        """
-        import pandas as pd  # type: ignore
-        import yaml  # type: ignore
-        from pathlib import Path
-        from camtl_yolo.external.ultralytics.ultralytics.utils import LOGGER
-
-        super().update_metrics(preds, batch)
-
-        if not self._is_main() or int(getattr(self, "batch_i", 0)) != 0:
-            return
-
-        save_dir = Path(getattr(self, "save_dir", Path("runs/val/exp")))
-        results_csv = save_dir / "results.csv"
-        args_yaml = save_dir / "args.yaml"
-        if not results_csv.exists() or not args_yaml.exists():
-            return
-
-        try:
-            df = pd.read_csv(results_csv)
-            current_epoch = int(df["epoch"].max()) if "epoch" in df.columns else 0
-            with open(args_yaml, "r", encoding="utf-8") as f:
-                args = yaml.safe_load(f) or {}
-            total_epochs = int(args.get("epochs", 0))
-        except Exception as e:
-            LOGGER.debug(f"[CAMTLValidator] reading results/args failed: {e}")
-            return
-
-        tps = set(int(x) for x in self._timepoints(total_epochs).tolist())
-        epoch_1based = int(current_epoch + 1)
-        if epoch_1based not in tps or epoch_1based in self._logged_epoch_saves:
-            return
-
-        base_dir = save_dir / "val_preds_fm" / f"epoch_{epoch_1based}"
-        fm_dir = base_dir / "feature_maps"
-        seg_dir = base_dir / "segment"
-        det_dir = base_dir / "detect"
-        base_dir.mkdir(parents=True, exist_ok=True)
-
-        # Decide batch type
-        is_seg_batch = bool(torch.as_tensor(batch.get("is_seg", False)).any().item())
-
-        # Use the unwrapped training model for the temporary forward
-        base_model = getattr(self, "_current_model_for_loss", None)
-        if not isinstance(base_model, nn.Module):
-            LOGGER.debug("[CAMTLValidator] base model not available for capture; skipping save.")
-            return
-
-        # Capture once and save. Hooks are removed before any checkpoint is written.
-        self._capture_once_and_save(
-            base_model=base_model,
-            batch=dict(batch),
-            fm_dir=fm_dir,
-            seg_dir=seg_dir,
-            det_dir=det_dir,
-            is_seg_batch=is_seg_batch,
-            det_preds=preds if isinstance(preds, (list, tuple)) and not is_seg_batch else None,
-        )
-
-        LOGGER.info(f"[CAMTLValidator] Saved validation assets for epoch {epoch_1based} to {base_dir}")
-        # Accumulate component losses for printing
-        base_model = getattr(self, "_current_model_for_loss", None)
-        if isinstance(base_model, nn.Module):
-            with torch.no_grad():
-                _, items = base_model.loss(batch, preds)  # same order as trainer.loss_names
-            # items: [det, seg, cons, align, l2sp, total, ...]
-            det_val = float(items[0])
-            seg_val = float(items[1])
-            cons_val = float(items[2])
-            align_val = float(items[3])
-            l2sp_val = float(items[4])
-            is_seg_batch = bool(torch.as_tensor(batch.get("is_seg", False)).any().item())
-            is_det_batch = bool(torch.as_tensor(batch.get("is_det", False)).any().item())
-            self._sum_det += det_val
-            self._sum_seg += seg_val
-            self._sum_cons += cons_val
-            self._sum_align += align_val
-            self._sum_l2sp += l2sp_val
-            self._cnt_det += int(is_det_batch)
-            self._cnt_seg += int(is_seg_batch)
-    # 3) Accumulate Dice per scale on seg batches
-        is_seg_batch = bool(torch.as_tensor(batch.get("is_seg", False)).any().item())
-        if is_seg_batch:
-            seg_preds = self._extract_seg_predictions(preds)
-            if isinstance(seg_preds, dict):
-                for k in ("p3", "p4", "p5"):
-                    if k in seg_preds:
-                        gt = batch.get(f"mask_{k}") 
-                        if gt is not None:
-                            d = self._dice(seg_preds[k], gt)
-                            self._dice_sums[k] += float(d)
-                            self._dice_counts[k] += 1
-                if "full" in seg_preds:
-                    gt_full = batch.get("mask")
-                    if gt_full is not None:
-                        d = self._dice(seg_preds["full"], gt_full)
-                        self._dice_sums["full"] += float(d)
-                        self._dice_counts["full"] += 1
-
-        # 4) Optional: only gating artifact-saving by rank/batch
-        if not self._is_main() or int(getattr(self, "batch_i", 0)) != 0:
-            return
-        self._logged_epoch_saves.add(epoch_1based)
-
-
-
-
-    def finalize_metrics(self) -> None:
-        """
-        No-op hook for now. Reserved for future aggregation on distributed setups.
-        """
-        return
-
-    def get_stats(self) -> Dict[str, float]:
-        """
-        Return validation statistics to be merged with loss items by BaseTrainer.
-        """
-        denom_all = max(1, self._cnt_det + self._cnt_seg)
-        avg_det = self._sum_det / max(1, self._cnt_det)
-        avg_seg = self._sum_seg / max(1, self._cnt_seg)
-        avg_cons = self._sum_cons / denom_all
-        avg_align = self._sum_align / denom_all
-        avg_l2sp = self._sum_l2sp / denom_all
-        avg_total = avg_det + avg_seg + avg_cons + avg_align + avg_l2sp
-
-        # Mean dice across segmentation batches
-        mean_dice = (
-            (self._dice_sums["p3"] + self._dice_sums["p4"] + self._dice_sums["p5"] + self._dice_sums["full"])
-            / max(1, self._dice_counts["p3"] + self._dice_counts["p4"] + self._dice_counts["p5"] + self._dice_counts["full"])
-        )
-
-        return {
-            "val/det": avg_det,
-            "val/seg": avg_seg,
-            "val/cons": avg_cons,
-            "val/align": avg_align,
-            "val/l2sp": avg_l2sp,
-            "val/total": avg_total,
-            "val/dice": mean_dice,
-            "val/dice_p3": self._dice_sums["p3"] / max(1, self._dice_counts["p3"]),
-            "val/dice_p4": self._dice_sums["p4"] / max(1, self._dice_counts["p4"]),
-            "val/dice_p5": self._dice_sums["p5"] / max(1, self._dice_counts["p5"]),
-            "val/dice_full": self._dice_sums["full"] / max(1, self._dice_counts["full"]),
-        }
-
-    def print_results(self) -> None:
-        """
-        Log compact per-epoch summary.
-        """
-        s = self.get_stats()
-        LOGGER.info(
-            f"val: det {s['val/det']:.4f} | seg {s['val/seg']:.4f} | cons {s['val/cons']:.4f} | "
-            f"align {s['val/align']:.4f} | l2sp {s['val/l2sp']:.4f} | total {s['val/total']:.4f} | "
-            f"dice p3 {s['val/dice_p3']:.4f} p4 {s['val/dice_p4']:.4f} p5 {s['val/dice_p5']:.4f} full {s['val/dice_full']:.4f}"
-        )
-
-    def get_desc(self) -> str:
-        """
-        Description string for progress bars.
-        """
-        return "[Validator] Cross-Attention Multi-Task Learning YOLO (M.Pascual et al. 2025)"
-
-    @property
-    def metric_keys(self) -> list[str]:
-        """
-        Keys that this validator can emit in stats.
-        """
-        return list(self.metrics.keys)
-
     # ---------------------- Core call ---------------------- #
 
     @smart_inference_mode()
@@ -314,7 +112,7 @@ class CAMTLValidator(BaseValidator):
             # half precision matches trainer AMP
             self.args.half = self.device.type != "cpu" and trainer.amp
             # pick EMA if available for forward, but compute losses with the underlying unwrapped model
-            fwd_model = trainer.ema.ema or trainer.model
+            fwd_model = trainer.model
             if trainer.args.compile and hasattr(fwd_model, "_orig_mod"):
                 fwd_model = fwd_model._orig_mod
             fwd_model = fwd_model.half() if self.args.half else fwd_model.float()
@@ -324,7 +122,7 @@ class CAMTLValidator(BaseValidator):
             self.loss = torch.zeros_like(trainer.loss_items, device=self.device)
 
             # model whose .loss we call (unwrapped)
-            base_model = unwrap_model(trainer.model)
+            self.base_model = unwrap_model(trainer.model)
         else:
             # Standalone evaluation path: accept a nn.Module or a checkpoint path
             if model is None:
@@ -336,7 +134,7 @@ class CAMTLValidator(BaseValidator):
             if isinstance(model, (str, _P)):
                 ckpt = torch.load(model, map_location="cpu", weights_only=False)
                 if isinstance(ckpt, dict):
-                    model = ckpt.get("ema") or ckpt.get("model") or ckpt
+                    model = ckpt.get("model") or ckpt
             if not isinstance(model, nn.Module):
                 raise TypeError("Loaded 'model' is not an nn.Module.")
 
@@ -350,13 +148,13 @@ class CAMTLValidator(BaseValidator):
             fwd_model = model.to(self.device)
             fwd_model = fwd_model.half() if self.args.half else fwd_model.float()
             unwrap_model(fwd_model).eval()
-            base_model = unwrap_model(fwd_model)
+            self.base_model = unwrap_model(fwd_model)
 
             # Ensure criteria exist on the loaded model
             need = ("segment_criterion", "detect_criterion", "consistency_criterion", "align_criterion")
-            if any(not hasattr(base_model, n) for n in need) and hasattr(base_model, "init_criterion"):
+            if any(not hasattr(self.base_model, n) for n in need) and hasattr(self.base_model, "init_criterion"):
                 try:
-                    base_model.init_criterion()
+                    self.base_model.init_criterion()
                 except Exception as e:
                     LOGGER.warning(f"[Validator] init_criterion() failed on loaded model: {e}")
 
@@ -435,9 +233,8 @@ class CAMTLValidator(BaseValidator):
             # Postprocess
             with dt[3]:
                 preds_pp = self.postprocess(preds)
-
+                
             # Make the model available to update_metrics for .loss(batch, preds) in both modes
-            self._current_model_for_loss = base_model
             self.update_metrics(preds_pp, batch)
 
             # Optional sample plots
@@ -463,12 +260,25 @@ class CAMTLValidator(BaseValidator):
                 imgs_b = torch.stack(viz_imgs, dim=0)  # [N, C, H, W]
                 # Map generic task name if needed; default to DomainShift1 layout
                 task = getattr(self.args, "task", "DomainShift1")
-                num = 0
-                out_file = Path(self.save_dir) / f"val_{str(task).lower()}_{num}.png"
-                if os.path.exists(out_file) and os.path.isfile(out_file):
-                    # Get the last digit in the filename
-                    num = int(out_file.stem.split("_")[-1]) + 1
-                    out_file = Path(self.save_dir) / f"val_{str(task).lower()}_{num}.png"
+                # Robustly select next numeric suffix even when >= 10
+                prefix = f"val_{str(task).lower()}_"
+                saving_folder = os.path.join(self.save_dir, "visualizations")
+                os.makedirs(saving_folder, exist_ok=True)
+                existing_files = list(Path(saving_folder).glob(f"{prefix}*.png"))
+                max_idx = -1
+                for p in existing_files:
+                    stem = p.stem  # e.g., val_task_12
+                    # Split once from the right and parse numeric suffix
+                    parts = stem.rsplit("_", 1)
+                    if len(parts) == 2 and parts[1].isdigit():
+                        try:
+                            idx = int(parts[1])
+                            if idx > max_idx:
+                                max_idx = idx
+                        except Exception:
+                            pass
+                num = max_idx + 1
+                out_file = Path(saving_folder) / f"{prefix}{num}.png"
                 make_final_camtl_viz(task=str(task), imgs=imgs_b, seg_outputs=viz_segs,
                                      out_path=out_file, max_images=16, rows=4)
         except Exception as e:
@@ -486,6 +296,200 @@ class CAMTLValidator(BaseValidator):
             return {k: round(float(v), 5) for k, v in merged.items()}
         else:
             return stats
+
+
+    def init_metrics(self, model: nn.Module) -> None:
+        """
+        Initialize counters and per-scale accumulators.
+        """
+        self.names = getattr(model, "names", {0: "object"})
+        self.nc = len(self.names) if isinstance(self.names, (list, dict)) else 1
+
+        # For BaseValidator compatibility
+        self.seen = 0
+        self.batch_i = 0
+
+        # Per-component loss totals (averaged at the end)
+        self._sum_det = 0.0
+        self._sum_seg = 0.0
+        self._sum_cons = 0.0
+        self._sum_align = 0.0
+        self._sum_l2sp = 0.0
+        self._cnt_det = 0
+        self._cnt_seg = 0
+
+        # Dice metrics disabled
+        self._dice_sums = {"p3": 0.0, "p4": 0.0, "p5": 0.0, "full": 0.0}
+        self._dice_counts = {"p3": 0, "p4": 0, "p5": 0, "full": 0}
+
+    def update_metrics(self, preds: Any, batch: Mapping[str, Any]) -> None:
+        """
+        Standard accumulation plus timepointed saving. Only rank-0 and only batch 0.
+        Saves under:
+            val_preds_fm/epoch_{k}/feature_maps/
+            val_preds_fm/epoch_{k}/segment/   (seg panel)
+            val_preds_fm/epoch_{k}/detect/    (det overlay)
+        """
+        super().update_metrics(preds, batch)      
+    
+        # Accumulate component losses for printing
+
+        if isinstance(self.base_model, nn.Module):
+            with torch.no_grad():
+                loss_fn = getattr(self.base_model, "loss", None)
+
+                if callable(loss_fn):
+                    _, items = loss_fn(batch, preds)  # same order as trainer.loss_names
+                else:
+                    items = [0.0, 0.0, 0.0, 0.0, 0.0]
+            # items: [det, seg, cons, align, l2sp, total, ...]
+            det_val = float(items[0])
+            seg_val = float(items[1])
+            cons_val = float(items[2])
+            align_val = float(items[3])
+            l2sp_val = float(items[4])
+            is_seg_batch = bool(torch.as_tensor(batch.get("is_seg", False)).any().item())
+            is_det_batch = bool(torch.as_tensor(batch.get("is_det", False)).any().item())
+            self._sum_det += det_val
+            self._sum_seg += seg_val
+            self._sum_cons += cons_val
+            self._sum_align += align_val
+            self._sum_l2sp += l2sp_val
+            self._cnt_det += int(is_det_batch)
+            self._cnt_seg += int(is_seg_batch)
+        # Accumulate Dice per scale on seg batches
+        is_seg_batch = bool(torch.as_tensor(batch.get("is_seg", False)).any().item())
+        if is_seg_batch:
+            seg_preds = self._extract_seg_predictions(preds)
+            if isinstance(seg_preds, dict):
+                for k in ("p3", "p4", "p5"):
+                    if k in seg_preds:
+                        gt = batch.get(f"mask_{k}") 
+                        if gt is not None:
+                            d = dice(seg_preds[k], gt)
+                            self._dice_sums[k] += float(d)
+                            self._dice_counts[k] += 1
+                if "full" in seg_preds:
+                    gt_full = batch.get("mask")
+                    if gt_full is not None:
+                        d = dice(seg_preds["full"], gt_full)
+                        self._dice_sums["full"] += float(d)
+                        self._dice_counts["full"] += 1
+        
+        LOGGER.debug(f"Now we enter the timepoint saving block")
+        save_dir = Path(getattr(self, "save_dir", Path("runs/val/exp")))
+        results_csv = save_dir / "results.csv"
+        args_yaml = save_dir / "args.yaml"
+
+        if not results_csv.exists() or not args_yaml.exists():
+            return
+        try:
+            df = pd.read_csv(results_csv)
+            current_epoch = int(df["epoch"].max()) if "epoch" in df.columns else 0
+            with open(args_yaml, "r", encoding="utf-8") as f:
+                args = yaml.safe_load(f) or {}
+            total_epochs = int(args.get("epochs", 0))
+        except Exception as e:
+            LOGGER.debug(f"[CAMTLValidator] reading results/args failed: {e}")
+            return
+        LOGGER.info(f"Current epoch from CSV: {current_epoch}, total epochs from args: {total_epochs}")
+        tps = set(int(x) for x in self._timepoints(total_epochs).tolist())
+        epoch_1based = int(current_epoch + 1)
+
+        # 4) Optional: only gating artifact-saving by rank/batch
+        if int(getattr(self, "batch_i", 0)) != 0:
+            return
+        self._logged_epoch_saves.add(epoch_1based)
+
+
+
+        if epoch_1based not in tps or epoch_1based in self._logged_epoch_saves:
+            return
+
+        base_dir = save_dir / "val_preds_fm" / f"epoch_{epoch_1based}"
+        fm_dir = base_dir / "feature_maps"
+        seg_dir = base_dir / "segment"
+        det_dir = base_dir / "detect"
+        base_dir.mkdir(parents=True, exist_ok=True)
+
+        # Decide batch type
+        is_seg_batch = bool(torch.as_tensor(batch.get("is_seg", False)).any().item())
+
+        # Capture once and save. Hooks are removed before any checkpoint is written.
+        self._capture_once_and_save(
+            base_model=self.base_model,
+            batch=dict(batch),
+            fm_dir=fm_dir,
+            seg_dir=seg_dir,
+            det_dir=det_dir,
+            is_seg_batch=is_seg_batch,
+            det_preds=preds if isinstance(preds, (list, tuple)) and not is_seg_batch else None,
+        )
+
+        LOGGER.info(f"[CAMTLValidator] Saved validation assets for epoch {epoch_1based} to {base_dir}")
+
+
+    def finalize_metrics(self) -> None:
+        """
+        No-op hook for now. Reserved for future aggregation on distributed setups.
+        """
+        return
+
+    def get_stats(self) -> Dict[str, float]:
+        """
+        Return validation statistics to be merged with loss items by BaseTrainer.
+        """
+        denom_all = max(1, self._cnt_det + self._cnt_seg)
+        avg_det = self._sum_det / max(1, self._cnt_det)
+        avg_seg = self._sum_seg / max(1, self._cnt_seg)
+        avg_cons = self._sum_cons / denom_all
+        avg_align = self._sum_align / denom_all
+        avg_l2sp = self._sum_l2sp / denom_all
+        avg_total = avg_det + avg_seg + avg_cons + avg_align + avg_l2sp
+
+        # Mean dice across segmentation batches
+        mean_dice = (
+            (self._dice_sums["p3"] + self._dice_sums["p4"] + self._dice_sums["p5"] + self._dice_sums["full"])
+            / max(1, self._dice_counts["p3"] + self._dice_counts["p4"] + self._dice_counts["p5"] + self._dice_counts["full"])
+        )
+
+        return {
+            "val/det": avg_det,
+            "val/seg": avg_seg,
+            "val/cons": avg_cons,
+            "val/align": avg_align,
+            "val/l2sp": avg_l2sp,
+            "val/total": avg_total,
+            "val/dice": mean_dice,
+            "val/dice_p3": self._dice_sums["p3"] / max(1, self._dice_counts["p3"]),
+            "val/dice_p4": self._dice_sums["p4"] / max(1, self._dice_counts["p4"]),
+            "val/dice_p5": self._dice_sums["p5"] / max(1, self._dice_counts["p5"]),
+            "val/dice_full": self._dice_sums["full"] / max(1, self._dice_counts["full"]),
+        }
+
+    def print_results(self) -> None:
+        """
+        Log compact per-epoch summary.
+        """
+        s = self.get_stats()
+        LOGGER.info(
+            f"val: det {s['val/det']:.4f} | seg {s['val/seg']:.4f} | cons {s['val/cons']:.4f} | "
+            f"align {s['val/align']:.4f} | l2sp {s['val/l2sp']:.4f} | total {s['val/total']:.4f} | "
+            f"dice p3 {s['val/dice_p3']:.4f} p4 {s['val/dice_p4']:.4f} p5 {s['val/dice_p5']:.4f} full {s['val/dice_full']:.4f}"
+        )
+        
+    def get_desc(self) -> str:
+        """
+        Description string for progress bars.
+        """
+        return "[Validator] Cross-Attention Multi-Task Learning YOLO (M.Pascual et al. 2025)"
+
+    @property
+    def metric_keys(self) -> list[str]:
+        """
+        Keys that this validator can emit in stats.
+        """
+        return list(self.metrics.keys)
 
     # ---------------------- Utilities ---------------------- #
 
@@ -505,39 +509,6 @@ class CAMTLValidator(BaseValidator):
             # if single element, fall through
             preds = preds[0]
         return preds
-
-    @staticmethod
-    def _dice(pred_logits: torch.Tensor, y: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
-        """
-        Soft Dice on probabilities; accepts logits or probabilities.
-
-        Args:
-            pred_logits: [B,1,h,w] or [B,1,H,W] logits or probabilities.
-            y:          [B,1,H,W] binary mask in {0,1} or float in [0,1].
-
-        Returns:
-            Mean Dice over batch as a scalar tensor.
-        """
-        if pred_logits.ndim == 3:
-            pred_logits = pred_logits.unsqueeze(1)
-        if y.ndim == 3:
-            y = y.unsqueeze(1)
-
-        # convert logits -> probabilities
-        p = torch.sigmoid(pred_logits) if pred_logits.dtype.is_floating_point else pred_logits
-
-        # resize to GT spatial size if needed
-        if p.shape[-2:] != y.shape[-2:]:
-            p = F.interpolate(p, size=y.shape[-2:], mode="bilinear", align_corners=False)
-
-        y = (y > 0.5).float()
-        inter = (p * y).sum(dim=(1, 2, 3))
-        denom = p.sum(dim=(1, 2, 3)) + y.sum(dim=(1, 2, 3))
-        dice = (2 * inter + eps) / (denom + eps)
-        return dice.mean()
-
-    def _is_main(self) -> bool:
-        return int(getattr(self, "rank", 0)) in (0, -1)
 
     def _timepoints(self, total_epochs: int) -> np.ndarray:
         import numpy as np
@@ -828,12 +799,13 @@ class CAMTLValidator(BaseValidator):
             stem = Path(im_files[bi]).stem if len(im_files) > bi else str(bi)
             for sk, t in self._seg_cache.items():
                 try:
-                    m = t[bi]
-                    if m.ndim == 3 and m.shape[0] == 1:
-                        m = m.squeeze(0)
-                    m = torch.sigmoid(m).detach().cpu().numpy()
-                    if m.ndim == 3:
-                        m = m[0]
+                    m_t = t[bi]
+                    if m_t.ndim == 3 and m_t.shape[0] == 1:
+                        m_t = m_t.squeeze(0)
+                    m_t = torch.sigmoid(m_t).detach().cpu()
+                    if m_t.ndim == 3:
+                        m_t = m_t[0]
+                    m = m_t.numpy()
                     m_img = (m * 255).astype("uint8")
                     cv2.imwrite(str(seg_dir / f"{stem}_{sk}.png"), m_img)
                     n_masks += 1

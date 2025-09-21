@@ -371,7 +371,19 @@ def multitask_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
 def build_dataloader(dataset: MultiTaskJSONDataset, batch_size: int, workers: int = 8,
                      shuffle: bool = True, drop_last: bool = False) -> DataLoader:
     from torch.utils.data import DataLoader
-    return DataLoader(
+    dl = DataLoader(
         dataset, batch_size=batch_size, shuffle=shuffle, num_workers=workers, pin_memory=True,
-        collate_fn=multitask_collate_fn, drop_last=drop_last,
+        collate_fn=multitask_collate_fn, drop_last=drop_last, persistent_workers=(workers > 0),
     )
+    # Ultralytics calls train_loader.reset() at close_mosaic. Provide a no-op.
+    if not hasattr(dl, "reset"):
+        def _reset() -> None:
+            # If you later add dataset.close_mosaic(), it will be honored here.
+            if hasattr(dl, "dataset") and hasattr(dl.dataset, "close_mosaic"):
+                try:
+                    dl.dataset.close_mosaic()
+                except Exception:
+                    pass
+            return None
+        setattr(dl, "reset", _reset)
+    return dl

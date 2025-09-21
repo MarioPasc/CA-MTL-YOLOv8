@@ -5,7 +5,8 @@ from typing import Dict
 import torch
 import torch.nn as nn
 from camtl_yolo.model.model import CAMTL_YOLO
-
+from typing import Dict, Iterable, Optional
+import math
 
 def _flat_state_dict_cycle_safe(src: nn.Module) -> Dict[str, torch.Tensor]:
     """Collect tensors without recursing into cycles."""
@@ -69,7 +70,7 @@ class SafeModelEMA:
     @torch.no_grad()
     def update(self, model: nn.Module):
         self.updates += 1
-        d = self.decay
+        d = self._current_decay()
         for n, p in model.named_parameters():
             if n in self._ema_params:
                 dst = self._ema_params[n]
@@ -80,6 +81,37 @@ class SafeModelEMA:
                 dstb = self._ema_buffers[n]
                 srcb = b.detach().to(device=dstb.device, dtype=dstb.dtype)
                 dstb.copy_(srcb)
+
+    def _current_decay(self, warmup_updates: int = 2000) -> float:
+        """Linear warmup of EMA decay over `warmup_updates` steps."""
+        if self.updates < warmup_updates:
+            return 0.0 + (self.decay - 0.0) * (self.updates / float(warmup_updates))
+        return self.decay
+
+    @torch.no_grad()
+    def hard_sync(self, model: nn.Module) -> None:
+        """Copy model → EMA exactly once. Use at resume or phase switch."""
+        sd = model.state_dict()
+        # ensure dtype/device match EMA tensors
+        for k, v in sd.items():
+            if k in self._ema_params:
+                self._ema_params[k].copy_(v.to(self._ema_params[k].device, dtype=self._ema_params[k].dtype))
+            elif k in self._ema_buffers:
+                self._ema_buffers[k].copy_(v.to(self._ema_buffers[k].device, dtype=self._ema_buffers[k].dtype))
+        # reset warmup so subsequent updates blend smoothly
+        self.updates = 0
+
+    def set_decay(self, decay: float) -> None:
+        """Adjust target decay dynamically if needed."""
+        self.decay = float(decay)
+
+    @torch.no_grad()
+    def load_state_dicts(self, ema_sd: Dict[str, torch.Tensor]) -> None:
+        """Restore EMA weights if available in a checkpoint."""
+        self.ema.load_state_dict(ema_sd, strict=False)
+        # rebuild fast views
+        self._ema_params = dict(self.ema.named_parameters())
+        self._ema_buffers = dict(self.ema.named_buffers())
 
     def update_attr(self, model: nn.Module, include: list[str] | None = None, exclude: list[str] | None = None):
         """Update simple attributes on the EMA clone from the source model.

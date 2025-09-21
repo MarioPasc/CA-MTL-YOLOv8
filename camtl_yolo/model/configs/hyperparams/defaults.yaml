@@ -7,7 +7,7 @@ data: ../data/data.yaml
 project: /home/mpascual/research/results/camtl_yolo
 name: DomainShift1
 
-epochs: 4
+epochs: 100
 batch: 2 
 imgsz: 512 
 

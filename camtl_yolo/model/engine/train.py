@@ -128,7 +128,9 @@ class CAMTLTrainer(BaseTrainer):
             metric_keys = self.validator.metrics.keys + self.label_loss_items(prefix="val")
             self.metrics = dict(zip(metric_keys, [0] * len(metric_keys)))
             # ---- SAFE EMA here ----
-            self.ema = SafeModelEMA(self.model)
+            self.ema = SafeModelEMA(unwrap_model(self.model), decay=float(getattr(self.args, "ema_decay", 0.9999)))
+            self.ema.update_attr(self.model, include=["yaml", "nc", "names", "args", "stride"])
+             
             if self.args.plots:
                 self.plot_training_labels()
 
@@ -151,7 +153,17 @@ class CAMTLTrainer(BaseTrainer):
             self.lf = lambda x: max(1 - x / self.epochs, 0) * (1.0 - self.args.lrf) + self.args.lrf
         self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=self.lf)
         self.stopper, self.stop = EarlyStopping(patience=self.args.patience), False
+
         self.resume_training(ckpt)
+        # After resume: restore EMA if present, else hard-sync from current weights
+        try:
+            if isinstance(ckpt, dict) and "ema" in ckpt and ckpt["ema"]:
+                self.ema.load_state_dicts(ckpt["ema"])
+            else:
+                self.ema.hard_sync(unwrap_model(self.model))
+        except Exception as e:
+            LOGGER.warning(f"[EMA] restore/sync failed: {e}")
+
         self.scheduler.last_epoch = self.start_epoch - 1
         self.run_callbacks("on_pretrain_routine_end")
 
@@ -261,6 +273,19 @@ class CAMTLTrainer(BaseTrainer):
                     setattr(alt, "num_workers", getattr(det_loader, "num_workers", 0) + getattr(seg_loader, "num_workers", 0))
                     setattr(alt, "batch_size", batch_size)
                     setattr(alt, "ratio", (rx, ry))
+                    
+                    # Ultralytics compatibility: expose .reset() that forwards to inner loaders if present.
+                    if not hasattr(alt, "reset"):
+                        def _alt_reset() -> None:
+                            for _ldr in (det_loader, seg_loader):
+                                if hasattr(_ldr, "reset"):
+                                    try:
+                                        _ldr.reset()
+                                    except Exception:
+                                        pass
+                            return None
+                        setattr(alt, "reset", _alt_reset)
+                    
                 except Exception:
                     pass
                 return alt
@@ -318,15 +343,15 @@ class CAMTLTrainer(BaseTrainer):
         if self.model.task == "DomainShift1":
             self.loss_names = (
                 "det", "seg", "cons", "align", "l2sp", "total",
-                "|  p3_bce", "p4_bce", "p5_bce",
-                "|  p3_dice", "p4_dice", "p5_dice",
+                "p3_bce", "p4_bce", "p5_bce",
+                "p3_dice", "p4_dice", "p5_dice",
             )
         else:
             self.loss_names = (
                 "det", "seg", "cons", "align", "l2sp", "total",
-                "|  box", "cls", "dfl",
-                "|  p3_bce", "p4_bce", "p5_bce",
-                "|  p3_dice", "p4_dice", "p5_dice",
+                "box", "cls", "dfl",
+                "p3_bce", "p4_bce", "p5_bce",
+                "p3_dice", "p4_dice", "p5_dice",
             )
         return CAMTLValidator(self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks)
 
