@@ -1,13 +1,13 @@
 # 
 task: DomainShift1 # Tasks: DomainShift1 (COCO-seg -> Retinography-seg); CAMTL (Retinography-seg -> Angiography: vessel-seg + stenosis-det);
-mode: train 
-model: ../models/camtl_yolov8.yaml
+mode: train
+model: ../models/domainshift1.yaml
 data: ../data/data.yaml
 
 project: /home/mpascual/research/results/camtl_yolo
 name: DomainShift1
 
-epochs: 100
+epochs: 4
 batch: 2 
 imgsz: 512 
 

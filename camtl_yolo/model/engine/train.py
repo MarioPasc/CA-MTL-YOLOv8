@@ -137,7 +137,13 @@ class CAMTLTrainer(BaseTrainer):
         # Optimizer
         self.accumulate = max(round(self.args.nbs / self.batch_size), 1)
         weight_decay = self.args.weight_decay * self.batch_size * self.accumulate / self.args.nbs
-        iterations = math.ceil(len(self.train_loader.dataset) / max(self.batch_size, self.args.nbs)) * self.epochs
+        iterations = self._compute_total_iterations(
+            loader=self.train_loader,
+            batch_size=self.batch_size,
+            nbs=self.args.nbs,
+            epochs=self.epochs,
+        )
+
         self.optimizer = self.build_optimizer(
             model=self.model,
             name=self.args.optimizer,
@@ -265,29 +271,20 @@ class CAMTLTrainer(BaseTrainer):
                     shuffle=True,
                 )
                 # Ratio X:Y from args or YAML
-                ratio = getattr(self.args, "camtl_ratio", None) or getattr(self.model, "yaml", {}).get("CAMTL_RATIO", [1, 1])
+                ratio = getattr(self.args, "camtl_ratio", None) or getattr(self.model.yaml, "CAMTL_RATIO", [1, 1])
                 rx, ry = int(ratio[0]), int(ratio[1])
                 alt = AlternatingLoader(det_loader, seg_loader, ratio=(rx, ry))
-                # Attach a few convenience attributes dynamically for logging/metrics
-                try:
-                    setattr(alt, "num_workers", getattr(det_loader, "num_workers", 0) + getattr(seg_loader, "num_workers", 0))
-                    setattr(alt, "batch_size", batch_size)
-                    setattr(alt, "ratio", (rx, ry))
-                    
-                    # Ultralytics compatibility: expose .reset() that forwards to inner loaders if present.
-                    if not hasattr(alt, "reset"):
-                        def _alt_reset() -> None:
-                            for _ldr in (det_loader, seg_loader):
-                                if hasattr(_ldr, "reset"):
-                                    try:
-                                        _ldr.reset()
-                                    except Exception:
-                                        pass
-                            return None
-                        setattr(alt, "reset", _alt_reset)
-                    
-                except Exception:
-                    pass
+                # convenience attrs for logs
+                setattr(alt, "num_workers", getattr(det_loader, "num_workers", 0) + getattr(seg_loader, "num_workers", 0))
+                setattr(alt, "batch_size", batch_size)
+                setattr(alt, "ratio", (rx, ry))
+                if not hasattr(alt, "reset"):
+                    def _alt_reset() -> None:
+                        for _ldr in (det_loader, seg_loader):
+                            if hasattr(_ldr, "reset"):
+                                try: _ldr.reset()
+                                except Exception: pass
+                    setattr(alt, "reset", _alt_reset)
                 return alt
 
             # For CAMTL val: single union loader, no alternation
@@ -523,7 +520,24 @@ class CAMTLTrainer(BaseTrainer):
             "Size",
         )
 
-    # ------------------------ Callbacks (logging + memory) ------------------------ #
+    # ------------------------ Helpers ------------------------ #
+
+    def _compute_total_iterations(self, loader, batch_size: int, nbs: int, epochs: int) -> int:
+        """
+        Return total optimizer iterations for schedulers/optimizers.
+
+        If the loader exposes `.dataset`, use the canonical Ultralytics logic:
+            ceil(len(dataset) / max(batch_size, nbs)) * epochs
+        Else fall back to: len(loader) * epochs, where len(loader) is number of batches/epoch.
+        """
+        import math
+        try:
+            ds_len = len(loader.dataset)  # standard DataLoader path
+            per_epoch = math.ceil(ds_len / max(batch_size, nbs))
+        except Exception:
+            per_epoch = len(loader)       # AlternatingLoader path
+        return int(per_epoch * epochs)
+
 
     def _log_ratio_once(self, trainer: BaseTrainer):
         """Log det:seg ratio exactly once at the start of training."""

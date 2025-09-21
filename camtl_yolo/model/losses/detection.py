@@ -25,11 +25,15 @@ class DetectionLoss(nn.Module):
         """
         Returns total_loss, item_dict. Delegates to Ultralytics implementation.
         """
-        loss, loss_items = self.crit(det_preds, batch)  # type: ignore[arg-type]
-        if isinstance(loss_items, dict):
+        loss, loss_items_raw = self.crit(det_preds, batch)  # type: ignore[arg-type]
+        if isinstance(loss_items_raw, dict):
             # ensure tensors
-            loss_items = {k: (v if isinstance(v, torch.Tensor) else torch.tensor(v, device=loss.device))
-                          for k, v in loss_items.items()}
+            loss_items: Dict[str, Tensor] = {
+                k: (v if isinstance(v, torch.Tensor) else torch.tensor(v, device=loss.device))
+                for k, v in loss_items_raw.items()
+            }
         else:
-            loss_items = {"det_loss": loss.detach()} # type: ignore[assignment]
-        return loss, loss_items # type: ignore[return-value]
+            # YOLOv8 returns box, cls, and dfl, in that order, inside a Tensor. Convert to dict.
+            li = loss_items_raw.detach()
+            loss_items: Dict[str, Tensor] = {"box": li[0], "cls": li[1], "dfl": li[2]}
+        return loss, loss_items

@@ -233,26 +233,27 @@ class CAMTL_YOLO(DetectionModel):
         Side effects:
             - Sets `self.detect_criterion`, `self.segment_criterion`,
             `self.consistency_criterion`, `self.align_criterion`
-            - Sets scalar weights: `_lambda_det`, `_lambda_seg`, `_lambda_cons`, `_lambda_align`
-
-        Returns:
-            None  (no callable is returned, so saving the model is pickle-safe)
+            - Sets scalar weights `_lambda_*`
+            - Attaches `_l2sp` callable if enabled (anchors captured after pretrained load)
         """
         from types import SimpleNamespace
+        import torch
 
         cfg = self.yaml.get("LOSS", {}) if isinstance(self.yaml, dict) else {}
         det_hyp = cfg.get("det_hyp") or {}
         det_defaults = {"box": 7.5, "cls": 0.5, "dfl": 1.5}
+        for k, v in det_defaults.items():
+            det_hyp.setdefault(k, v)
 
-        # Ensure self.args carries detection hyperparameters used by DetectLoss
-        if not hasattr(self, "args") or self.args is None:
-            self.args = SimpleNamespace(**{**det_defaults, **det_hyp})
-        else:
-            for k, v in {**det_defaults, **det_hyp}.items():
+        # Expose Ultralytics-style args if available
+        if not hasattr(self, "args"):
+            self.args = SimpleNamespace()
+        if isinstance(det_hyp, dict):
+            for k, v in det_hyp.items():
                 if not hasattr(self.args, k):
                     setattr(self.args, k, v)
 
-        # Instantiate sub-criteria
+        # Sub-criteria
         self.detect_criterion = DetectionLoss(self, hyp=det_hyp)
         self.segment_criterion = DeepSupervisionBCEDiceLoss(
             w_p3=float(cfg.get("w_p3", 1.0)),
@@ -270,23 +271,83 @@ class CAMTL_YOLO(DetectionModel):
             weight=float(cfg.get("align", 0.1)),
         )
 
-        # Global scalars
+        # Scalars
         self._lambda_det = float(cfg.get("lambda_det", 1.0))
         self._lambda_seg = float(cfg.get("lambda_seg", 1.0))
         self._lambda_cons = float(cfg.get("lambda_cons", 0.1))
         self._lambda_align = float(cfg.get("lambda_align", 0.1))
+        l2sp_lambda = float(cfg.get("lambda_l2sp", 0.0))
 
-        # No return. Avoid attaching any callable that would break pickling.
+        # ---- L2-SP: capture anchors after weights are loaded ----
+        # Include backbone+neck, exclude heads and attention by simple name filters.
+        def _l2sp_include(name: str) -> bool:
+            skip_tags = (".cv2.", ".cv3.", ".dfl.", "SegHeadMulti", "CTAM", "CSAM", "FPMA", "Detect")
+            return (not any(t in name for t in skip_tags))
+
+        if l2sp_lambda > 0.0:
+            device = next(self.parameters()).device
+            anchors: dict[str, torch.Tensor] = {}
+            for n, p in self.named_parameters():
+                if p.requires_grad and _l2sp_include(n):
+                    anchors[n] = p.detach().clone().to(device=device, dtype=p.dtype)
+            # store once
+            self._l2sp_anchors = anchors
+
+            def _l2sp_fn(_self) -> torch.Tensor:
+                loss = torch.zeros((), device=device, dtype=torch.float32)
+                for n, ref in _self._l2sp_anchors.items():
+                    p = dict(_self.named_parameters()).get(n, None)
+                    if p is None:
+                        continue
+                    # squared deviation towards source reference
+                    loss = loss + torch.sum((p.float() - ref.float()) ** 2)
+                return loss * l2sp_lambda
+
+            self._l2sp = _l2sp_fn
+        else:
+            self._l2sp = None  # explicit
+
+        # no return
+
+
+
+    def _ensure_loss_reporting(self) -> None:
+        """
+        Ensure the model exposes a stable loss header aligned with the fixed-length loss vector.
+        Length and order must match what `loss()` returns every step.
+        """
+        names = (
+            # high-level scalars
+            "det", "seg", "cons", "align", "l2sp", "total",
+            # detection breakdown
+            "box", "cls", "dfl",
+            # segmentation breakdown (deep supervision)
+            "p3_bce", "p4_bce", "p5_bce",
+            "p3_dice", "p4_dice", "p5_dice",
+        )
+        # Set once. Ultralytics trainer will read `self.loss_names`.
+        if not hasattr(self, "loss_names"):
+            self.loss_names = names  # tuple is fine
 
 
     def loss(self, batch, preds):
         """
-        Compute CAMTL multi-task loss robustly.
+        CAMTL multi-task loss with fixed-length reporting.
 
-        Behavior:
-        - Handles missing keys by treating the absent component as 0.
-        - Aggregates into a 6-term vector [det, seg, cons, align, l2sp, total] on the correct device.
+        Returns:
+            total: scalar tensor
+            loss_items: 1D tensor of length 15 with the following order:
+
+            ("det","seg","cons","align","l2sp","total",
+            "box","cls","dfl",
+            "p3_bce","p4_bce","p5_bce","p3_dice","p4_dice","p5_dice")
+
+        Absent components are zero. Shapes and header names are stable across steps.
         """
+
+        # Ensure header exists before trainer reads it
+        self._ensure_loss_reporting()
+
         # Unpack predictions
         if isinstance(preds, (list, tuple)) and len(preds) == 2:
             det_preds, seg_preds = preds
@@ -294,71 +355,95 @@ class CAMTL_YOLO(DetectionModel):
             det_preds, seg_preds = preds, None
 
         device = batch["img"].device
+        dtype = torch.float32  # reporting dtype; computation dtype is carried by individual criteria
 
-        # Flags and safe accessors
-        bboxes = batch.get("bboxes", None)
-        is_seg_flag = batch.get("is_seg", None)
-        has_det = torch.is_tensor(bboxes) and bboxes.numel() > 0
+        # ---- Task flags (robust) ----
+        # Accept several conventions to avoid key errors
+        def _truthy(x):
+            if torch.is_tensor(x):
+                return bool(x.detach().sum().item() > 0)
+            if isinstance(x, (list, tuple)):
+                return any(bool(v) for v in x)
+            return bool(x)
+
+        has_det = False
+        if "bboxes" in batch:
+            bx = batch["bboxes"]
+            has_det = torch.is_tensor(bx) and bx.numel() > 0
+        elif "is_det" in batch:
+            has_det = _truthy(batch["is_det"])
+        elif batch.get("task", None) == "det":
+            has_det = True
+
         has_seg = False
-        if torch.is_tensor(is_seg_flag):
-            has_seg = bool(is_seg_flag.any().item())
-        elif isinstance(is_seg_flag, (list, tuple)):
-            has_seg = any(bool(x) for x in is_seg_flag)
+        if "is_seg" in batch:
+            has_seg = _truthy(batch["is_seg"])
+        elif batch.get("task", None) == "seg":
+            has_seg = True
+        elif "masks" in batch:
+            mk = batch["masks"]
+            has_seg = torch.is_tensor(mk) and mk.numel() > 0
 
-        # Detection
-        loss_det = torch.zeros((), device=device)
+        # ---- Defaults to avoid UnboundLocalError ----
+        det_box = det_cls = det_dfl = 0.0
+        p3_bce = p4_bce = p5_bce = 0.0
+        p3_dice = p4_dice = p5_dice = 0.0
+
+        # ---- Detection loss ----
+        loss_det = torch.zeros((), device=device, dtype=dtype)
         if has_det:
             try:
-                l_det, _det_items = self.detect_criterion(det_preds, batch)
-                det_box = float(getattr(_det_items, "get", lambda *_: 0.0)("box") if isinstance(_det_items, dict) else 0.0)
-                det_cls = float(getattr(_det_items, "get", lambda *_: 0.0)("cls") if isinstance(_det_items, dict) else 0.0)
-                det_dfl = float(getattr(_det_items, "get", lambda *_: 0.0)("dfl") if isinstance(_det_items, dict) else 0.0)
-                
+                l_det, det_items = self.detect_criterion(det_preds, batch)  # Ultralytics-style
+                # det_items may be dict with 'box','cls','dfl'
+                if isinstance(det_items, dict):
+                    det_box = float(det_items.get("box", 0.0))
+                    det_cls = float(det_items.get("cls", 0.0))
+                    det_dfl = float(det_items.get("dfl", 0.0))
                 loss_det = l_det if l_det.ndim == 0 else l_det.sum()
             except Exception as e:
                 LOGGER.warning(f"[loss] detection loss failed: {e}")
 
-        # Segmentation
-        loss_seg = torch.zeros((), device=device)
+        # ---- Segmentation loss ----
+        loss_seg = torch.zeros((), device=device, dtype=dtype)
         if has_seg:
             try:
-                l_seg, _seg_items = self.segment_criterion(seg_preds, batch)
-            
-                # l_seg, seg_items = self.segment_criterion(...); seg_items has '{p3,p4,p5}_{bce,dice}'
-                p3_bce = float(_seg_items.get("p3_bce", 0.0)) if isinstance(_seg_items, dict) else 0.0
-                p4_bce = float(_seg_items.get("p4_bce", 0.0)) if isinstance(_seg_items, dict) else 0.0
-                p5_bce = float(_seg_items.get("p5_bce", 0.0)) if isinstance(_seg_items, dict) else 0.0
-                p3_dice = float(_seg_items.get("p3_dice", 0.0)) if isinstance(_seg_items, dict) else 0.0
-                p4_dice = float(_seg_items.get("p4_dice", 0.0)) if isinstance(_seg_items, dict) else 0.0
-                p5_dice = float(_seg_items.get("p5_dice", 0.0)) if isinstance(_seg_items, dict) else 0.0
-
+                l_seg, seg_items = self.segment_criterion(seg_preds, batch)
+                if isinstance(seg_items, dict):
+                    p3_bce = float(seg_items.get("p3_bce", 0.0))
+                    p4_bce = float(seg_items.get("p4_bce", 0.0))
+                    p5_bce = float(seg_items.get("p5_bce", 0.0))
+                    p3_dice = float(seg_items.get("p3_dice", 0.0))
+                    p4_dice = float(seg_items.get("p4_dice", 0.0))
+                    p5_dice = float(seg_items.get("p5_dice", 0.0))
                 loss_seg = l_seg if l_seg.ndim == 0 else l_seg.sum()
             except Exception as e:
                 LOGGER.warning(f"[loss] segmentation loss failed: {e}")
 
-        # Consistency and alignment
-        cons_loss = torch.zeros((), device=device)
+        # ---- Consistency and alignment (safe) ----
+        cons_loss = torch.zeros((), device=device, dtype=dtype)
         try:
             c_l, _ = self.consistency_criterion(seg_preds, batch)
             cons_loss = c_l if c_l.ndim == 0 else c_l.sum()
         except Exception as e:
             LOGGER.warning(f"[loss] consistency loss failed: {e}")
 
-        align_loss = torch.zeros((), device=device)
+        # alignment: only meaningful if both domains are present in the training regime
+        align_loss = torch.zeros((), device=device, dtype=dtype)
         try:
+            # In CAMTL you only feed target-domain batches, so this will remain 0 unless you mix source.
             a_l, _ = self.align_criterion(batch)
             align_loss = a_l if a_l.ndim == 0 else a_l.sum()
         except Exception as e:
             LOGGER.warning(f"[loss] alignment loss failed: {e}")
 
         # L2-SP
-        l2sp_term = torch.zeros((), device=device)
+        l2sp_term = torch.zeros((), device=device, dtype=dtype)
         if getattr(self, "_l2sp", None) is not None:
             try:
                 l2sp_term = self._l2sp(self)
             except Exception as e:
                 LOGGER.warning(f"[loss] L2-SP failed: {e}")
-
+        # ---- Total ----
         total = (
             self._lambda_det * loss_det
             + self._lambda_seg * loss_seg
@@ -367,33 +452,22 @@ class CAMTL_YOLO(DetectionModel):
             + l2sp_term
         )
 
-        loss_items = [
-            loss_det.detach(), 
-            loss_seg.detach(), 
-            cons_loss.detach(), 
-            align_loss.detach(), 
-            l2sp_term.detach(), 
-            total.detach(),
+        # ---- Fixed-length reporting tensor (15) ----
+        vals = [
+            loss_det.detach(), loss_seg.detach(), cons_loss.detach(), align_loss.detach(), l2sp_term.detach(), total.detach(),
+            torch.tensor(det_box, device=device, dtype=dtype),
+            torch.tensor(det_cls, device=device, dtype=dtype),
+            torch.tensor(det_dfl, device=device, dtype=dtype),
+            torch.tensor(p3_bce, device=device, dtype=dtype),
+            torch.tensor(p4_bce, device=device, dtype=dtype),
+            torch.tensor(p5_bce, device=device, dtype=dtype),
+            torch.tensor(p3_dice, device=device, dtype=dtype),
+            torch.tensor(p4_dice, device=device, dtype=dtype),
+            torch.tensor(p5_dice, device=device, dtype=dtype),
         ]
-
-        if has_det:
-            loss_items.extend([
-                torch.tensor(det_box, device=total.device, dtype=total.dtype),
-                torch.tensor(det_cls, device=total.device, dtype=total.dtype),
-                torch.tensor(det_dfl, device=total.device, dtype=total.dtype),
-            ])
-        if has_seg:
-            loss_items.extend([
-                torch.tensor(p3_bce, device=total.device, dtype=total.dtype),
-                torch.tensor(p4_bce, device=total.device, dtype=total.dtype),
-                torch.tensor(p5_bce, device=total.device, dtype=total.dtype),
-                torch.tensor(p3_dice, device=total.device, dtype=total.dtype),
-                torch.tensor(p4_dice, device=total.device, dtype=total.dtype),
-                torch.tensor(p5_dice, device=total.device, dtype=total.dtype),
-            ])
-
-        loss_items = torch.stack(loss_items) if loss_items else torch.zeros(6, device=device)
+        loss_items = torch.stack(vals, dim=0)
         return total, loss_items
+
 
     @torch.no_grad()
     def save_task_checkpoint(self, save_dir: str | Path, filename: str | None = None,

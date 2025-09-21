@@ -147,10 +147,10 @@ def _pick_gn_groups(channels: int, max_groups: int = 32) -> int:
 
 def replace_seg_stream_bn_with_groupnorm(model: nn.Module, max_groups: int = 32) -> int:
     """
-    Replace nn.BatchNorm2d under SegHead/FPMA/CTAM subtrees with GroupNorm.
+    Replace nn.BatchNorm2d under SegHeadMulti/FPMA/CTAM subtrees with GroupNorm.
     Returns number of layers replaced.
     """
-    from camtl_yolo.model.nn import SegHead, FPMA, CTAM  # local types
+    from camtl_yolo.model.nn import SegHeadMulti, FPMA, CTAM  # local types
 
     def _convert_bn_to_gn(bn: nn.BatchNorm2d) -> nn.GroupNorm:
         gn = nn.GroupNorm(num_groups=_pick_gn_groups(bn.num_features, max_groups),
@@ -186,7 +186,7 @@ def replace_seg_stream_bn_with_groupnorm(model: nn.Module, max_groups: int = 32)
             visit(child)
 
     # Only start from segmentation roots to avoid touching backbone/detect
-    seg_roots = [m for m in model.modules() if isinstance(m, (SegHead, FPMA, CTAM))]
+    seg_roots = [m for m in model.modules() if isinstance(m, (SegHeadMulti, FPMA, CTAM))]
     for r in seg_roots:
         visit(r)
 
@@ -198,13 +198,13 @@ def replace_seg_stream_bn_with_groupnorm(model: nn.Module, max_groups: int = 32)
 def convert_backbone_and_detect_to_dual_bn(model: nn.Module) -> int:
     """
     Convert BatchNorm2d in backbone and Detect head to DualBatchNorm2d.
-    Skips SegHead/FPMA/CTAM entirely. Returns number of layers converted.
+    Skips SegHeadMulti/FPMA/CTAM entirely. Returns number of layers converted.
     """
-    from camtl_yolo.model.nn import SegHead, FPMA, CTAM
+    from camtl_yolo.model.nn import SegHeadMulti, FPMA, CTAM
     from camtl_yolo.external.ultralytics.ultralytics.nn.modules import Detect
 
     def _should_skip(m: nn.Module) -> bool:
-        return isinstance(m, (SegHead, FPMA, CTAM))
+        return isinstance(m, (SegHeadMulti, FPMA, CTAM))
 
     converted = 0
     visited: set[int] = set()

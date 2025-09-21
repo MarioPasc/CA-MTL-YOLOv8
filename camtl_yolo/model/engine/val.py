@@ -324,63 +324,57 @@ class CAMTLValidator(BaseValidator):
 
     def update_metrics(self, preds: Any, batch: Mapping[str, Any]) -> None:
         """
-        Standard accumulation plus timepointed saving. Only rank-0 and only batch 0.
-        Saves under:
-            val_preds_fm/epoch_{k}/feature_maps/
-            val_preds_fm/epoch_{k}/segment/   (seg panel)
-            val_preds_fm/epoch_{k}/detect/    (det overlay)
+        Accumulate losses and Dice. Save feature maps and panels at selected epochs.
+        Fix: do not mark an epoch as logged before passing the gating checks.
         """
-        super().update_metrics(preds, batch)      
-    
-        # Accumulate component losses for printing
+        super().update_metrics(preds, batch)
 
+        # ----- loss accumulation -----
         if isinstance(self.base_model, nn.Module):
             with torch.no_grad():
                 loss_fn = getattr(self.base_model, "loss", None)
-
                 if callable(loss_fn):
-                    _, items = loss_fn(batch, preds)  # same order as trainer.loss_names
+                    _, items = loss_fn(batch, preds)
                 else:
-                    items = [0.0, 0.0, 0.0, 0.0, 0.0]
-            # items: [det, seg, cons, align, l2sp, total, ...]
-            det_val = float(items[0])
-            seg_val = float(items[1])
-            cons_val = float(items[2])
-            align_val = float(items[3])
-            l2sp_val = float(items[4])
+                    items = torch.zeros(15)
+
+            det_val = float(items[0]); seg_val = float(items[1]); cons_val = float(items[2])
+            align_val = float(items[3]); l2sp_val = float(items[4])
+
+            # robust task flags
             is_seg_batch = bool(torch.as_tensor(batch.get("is_seg", False)).any().item())
-            is_det_batch = bool(torch.as_tensor(batch.get("is_det", False)).any().item())
-            self._sum_det += det_val
-            self._sum_seg += seg_val
+            has_det = ("bboxes" in batch) and torch.is_tensor(batch["bboxes"]) and batch["bboxes"].numel() > 0
+            is_det_batch = bool(has_det and not is_seg_batch)
+
+            # accumulate with correct denominators
+            if is_det_batch:
+                self._sum_det += det_val
+                self._cnt_det += 1
+            if is_seg_batch:
+                self._sum_seg += seg_val
+                self._cnt_seg += 1
+            # components defined for both streams aggregate over all batches
             self._sum_cons += cons_val
             self._sum_align += align_val
             self._sum_l2sp += l2sp_val
-            self._cnt_det += int(is_det_batch)
-            self._cnt_seg += int(is_seg_batch)
-        # Accumulate Dice per scale on seg batches
+
+        # ----- Dice accumulation (unchanged) -----
         is_seg_batch = bool(torch.as_tensor(batch.get("is_seg", False)).any().item())
         if is_seg_batch:
             seg_preds = self._extract_seg_predictions(preds)
             if isinstance(seg_preds, dict):
                 for k in ("p3", "p4", "p5"):
-                    if k in seg_preds:
-                        gt = batch.get(f"mask_{k}") 
-                        if gt is not None:
-                            d = dice(seg_preds[k], gt)
-                            self._dice_sums[k] += float(d)
-                            self._dice_counts[k] += 1
-                if "full" in seg_preds:
-                    gt_full = batch.get("mask")
-                    if gt_full is not None:
-                        d = dice(seg_preds["full"], gt_full)
-                        self._dice_sums["full"] += float(d)
-                        self._dice_counts["full"] += 1
-        
-        LOGGER.debug(f"Now we enter the timepoint saving block")
+                    if k in seg_preds and batch.get(f"mask_{k}") is not None:
+                        d = dice(seg_preds[k], batch[f"mask_{k}"])
+                        self._dice_sums[k] += float(d); self._dice_counts[k] += 1
+                if "full" in seg_preds and batch.get("mask") is not None:
+                    d = dice(seg_preds["full"], batch["mask"])
+                    self._dice_sums["full"] += float(d); self._dice_counts["full"] += 1
+
+        # ----- timepointed saving gate -----
         save_dir = Path(getattr(self, "save_dir", Path("runs/val/exp")))
         results_csv = save_dir / "results.csv"
         args_yaml = save_dir / "args.yaml"
-
         if not results_csv.exists() or not args_yaml.exists():
             return
         try:
@@ -389,33 +383,23 @@ class CAMTLValidator(BaseValidator):
             with open(args_yaml, "r", encoding="utf-8") as f:
                 args = yaml.safe_load(f) or {}
             total_epochs = int(args.get("epochs", 0))
-        except Exception as e:
-            LOGGER.debug(f"[CAMTLValidator] reading results/args failed: {e}")
+        except Exception:
             return
-        LOGGER.debug(f"Current epoch from CSV: {current_epoch}, total epochs from args: {total_epochs}")
+
+        if int(getattr(self, "batch_i", 0)) != 0:
+            return
+
         tps = set(int(x) for x in self._timepoints(total_epochs).tolist())
         epoch_1based = int(current_epoch + 1)
 
-        # 4) Optional: only gating artifact-saving by rank/batch
-        if int(getattr(self, "batch_i", 0)) != 0:
-            return
-        self._logged_epoch_saves.add(epoch_1based)
-
-
-
-        if epoch_1based not in tps or epoch_1based in self._logged_epoch_saves:
+        # Correct order: check gates first, then mark as logged after saving
+        if (epoch_1based not in tps) or (epoch_1based in self._logged_epoch_saves):
             return
 
         base_dir = save_dir / "val_preds_fm" / f"epoch_{epoch_1based}"
-        fm_dir = base_dir / "feature_maps"
-        seg_dir = base_dir / "segment"
-        det_dir = base_dir / "detect"
+        fm_dir = base_dir / "feature_maps"; seg_dir = base_dir / "segment"; det_dir = base_dir / "detect"
         base_dir.mkdir(parents=True, exist_ok=True)
 
-        # Decide batch type
-        is_seg_batch = bool(torch.as_tensor(batch.get("is_seg", False)).any().item())
-
-        # Capture once and save. Hooks are removed before any checkpoint is written.
         self._capture_once_and_save(
             base_model=self.base_model,
             batch=dict(batch),
@@ -426,6 +410,7 @@ class CAMTLValidator(BaseValidator):
             det_preds=preds if isinstance(preds, (list, tuple)) and not is_seg_batch else None,
         )
 
+        self._logged_epoch_saves.add(epoch_1based)
         LOGGER.info(f"[CAMTLValidator] Saved validation assets for epoch {epoch_1based} to {base_dir}")
 
 

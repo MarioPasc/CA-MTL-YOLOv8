@@ -403,6 +403,8 @@ def plot_camtl_metrics(trainer) -> None:
 # Augmentation debug grid (pre/post + downsampled)
 # =========================
 
+from typing import Tuple
+
 def overlay_mask_on_image_bgr(
     img_bgr: np.ndarray,
     mask2d: np.ndarray,
@@ -432,20 +434,6 @@ def overlay_mask_on_image_bgr(
     m3 = m[..., None]
     comp = img * (1.0 - alpha * m3) + overlay * (alpha * m3)
     return np.clip(comp, 0, 255).astype(np.uint8)
-
-
-def _to_vis_bgr_from_mask(mask2d: np.ndarray, target_hw: Tuple[int, int]) -> np.ndarray:
-    """Convert a single-channel mask to 3-channel BGR image for visualization."""
-    h, w = target_hw
-    if mask2d.shape != (h, w):
-        mask2d = cv2.resize(mask2d, (w, h), interpolation=cv2.INTER_NEAREST)
-    if mask2d.dtype != np.uint8:
-        m = np.clip(mask2d, 0.0, 1.0)
-        mask_u8 = (m * 255).astype(np.uint8)
-    else:
-        mask_u8 = mask2d
-    return cv2.cvtColor(mask_u8, cv2.COLOR_GRAY2BGR)
-
 
 def save_aug_debug_grid(
     out_path: Path,
@@ -614,34 +602,18 @@ def make_final_camtl_viz(
     rows: int = 4
 ) -> Path:
     """
-    Render final visualization for CAMTL project.
-
-    Parameters
-    ----------
-    task : str
-        "DomainShift1" renders a grid with columns [img+full] | [P3] | [P4] | [P5].
-        "CAMTL" writes a black canvas placeholder.
-    imgs : torch.Tensor
-        Batch of images [B,C,H,W], values in [0,1] recommended.
-    seg_outputs : dict or list of dict
-        Segmentation outputs holding tensors per scale. Expected keys: 'full','p3','p4','p5'.
-    out_path : str or Path
-        Output file path (PNG).
-    max_images : int
-        Max number of images to render (default 16).
-    rows : int
-        Number of rows in the grid (default 4). Columns are fixed to 4.
-
-    Returns
-    -------
-    Path
-        Saved figure path.
+    Render per-epoch CAMTL panel.
+    Columns: [img + full overlay] | [P3] | [P4] | [P5].
+    - P3/P4/P5 use a probability colormap with a shared horizontal colorbar (0→1).
+    - The 'full' overlay uses overlay_mask_on_image_bgr so transparency scales with probability.
     """
+    from matplotlib import cm
+    from matplotlib import colors as mcolors
+
     out_p = Path(out_path)
     out_p.parent.mkdir(parents=True, exist_ok=True)
 
     if task == "CAMTL":
-        # Placeholder black canvas 1024x1024
         fig = plt.figure(figsize=(8, 8), facecolor="black")
         ax = fig.add_subplot(1, 1, 1)
         ax.set_facecolor("black")
@@ -649,9 +621,6 @@ def make_final_camtl_viz(
         fig.savefig(out_p, dpi=200, bbox_inches="tight", facecolor=fig.get_facecolor())
         plt.close(fig)
         return out_p
-
-    if task != "DomainShift1":
-        LOGGER.warning(f"Unknown task '{task}', defaulting to DomainShift1 layout.")
 
     if imgs.ndim != 4:
         raise ValueError(f"'imgs' must be [B,C,H,W], got {tuple(imgs.shape)}")
@@ -661,16 +630,20 @@ def make_final_camtl_viz(
     cols = 4
     rows = min(rows, (n + cols - 1) // cols) if rows > 0 else (n + cols - 1) // cols
 
-    fig_w = 4 * 4  # 4 columns * 4 inches
+    fig_w = 4 * 4
     fig_h = rows * 4
     fig, axes = plt.subplots(rows, cols, figsize=(fig_w, fig_h), squeeze=False)
     for ax in axes.ravel():
         ax.axis("off")
 
-    # Titles only on first row
-    col_titles = ["img + full", "P3 (64×64)", "P4 (32×32)", "P5 (16×16)"]
+    col_titles = ["img + full", "P3", "P4", "P5"]
     for j in range(cols):
         axes[0][j].set_title(col_titles[j])
+
+    # unified colormap and colorbar for p3/p4/p5
+    cmap = cm.get_cmap("magma")
+    norm = mcolors.Normalize(vmin=0.0, vmax=1.0)
+    sm = cm.ScalarMappable(norm=norm, cmap=cmap)  # for the colorbar
 
     for i in range(n):
         r = i // cols
@@ -678,24 +651,26 @@ def make_final_camtl_viz(
         img_bgr = _to_hwc_uint8(imgs[i])
         seg = _extract_single_seg_for_index(seg_outputs, i)
 
-        # Panel 1: original + full overlay at 512x512 using mask after activation
-        base = cv2.resize(img_bgr, (W, H), interpolation=cv2.INTER_NEAREST)
-        c0.imshow(base[..., ::-1])  # display RGB
-
+        # Panel 1: image + full overlay via robust compositor
+        c0.imshow(img_bgr[..., ::-1])  # show RGB
         full_m = seg.get("full")
         if full_m is not None:
-            full_up = _resize_mask(full_m, W, H)
-            # Transparent background, red overlay with fixed alpha=0.7
-            c0.imshow(full_up, cmap="Reds", alpha=0.7, interpolation="nearest")
+            full_up = _resize_mask(full_m, W, H)                                   # [H,W], 0..1
+            over_bgr = overlay_mask_on_image_bgr(img_bgr, full_up, color=(255, 0, 0), alpha=0.35)
+            c0.imshow(over_bgr[..., ::-1])                                         # show RGB
         c0.axis("off")
 
-        # Panels: P3, P4, P5 upsampled with nearest neighbor to (W,H)
-        for ax, key in zip((c1, c2, c3), ("p3", "p4", "p5")):
+        # P3/P4/P5 with probability colormap
+        for ax, key in ((c1, "p3"), (c2, "p4"), (c3, "p5")):
             mk = seg.get(key)
             if mk is not None:
                 mk_up = _resize_mask(mk, W, H)
-                ax.imshow(mk_up, interpolation="nearest", cmap="gray")
+                ax.imshow(mk_up, interpolation="nearest", cmap=cmap, norm=norm)
             ax.axis("off")
+
+    # single horizontal colorbar spanning the last three columns
+    right_axes = [axes[r][j] for r in range(rows) for j in (1, 2, 3)]
+    fig.colorbar(sm, ax=right_axes, orientation="horizontal", fraction=0.035, pad=0.04, label="activation probability")
 
     fig.tight_layout()
     fig.savefig(out_p, dpi=200, bbox_inches="tight")
