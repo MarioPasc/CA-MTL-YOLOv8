@@ -452,19 +452,38 @@ class CAMTL_YOLO(DetectionModel):
             + l2sp_term
         )
 
-        # ---- Fixed-length reporting tensor (15) ----
-        vals = [
-            loss_det.detach(), loss_seg.detach(), cons_loss.detach(), align_loss.detach(), l2sp_term.detach(), total.detach(),
-            torch.tensor(det_box, device=device, dtype=dtype),
-            torch.tensor(det_cls, device=device, dtype=dtype),
-            torch.tensor(det_dfl, device=device, dtype=dtype),
-            torch.tensor(p3_bce, device=device, dtype=dtype),
-            torch.tensor(p4_bce, device=device, dtype=dtype),
-            torch.tensor(p5_bce, device=device, dtype=dtype),
-            torch.tensor(p3_dice, device=device, dtype=dtype),
-            torch.tensor(p4_dice, device=device, dtype=dtype),
-            torch.tensor(p5_dice, device=device, dtype=dtype),
-        ]
+        # ---- Reporting tensor (task-aware ordering/length) ----
+        task = str(getattr(self, "task", "DomainShift1"))
+        if task == "DomainShift1":
+            # Expected by CAMTLTrainer for DomainShift1 (12 items, no det breakdown)
+            vals = [
+                loss_det.detach(),
+                loss_seg.detach(),
+                cons_loss.detach(),
+                align_loss.detach(),
+                l2sp_term.detach(),
+                total.detach(),
+                torch.tensor(p3_bce, device=device, dtype=dtype),
+                torch.tensor(p4_bce, device=device, dtype=dtype),
+                torch.tensor(p5_bce, device=device, dtype=dtype),
+                torch.tensor(p3_dice, device=device, dtype=dtype),
+                torch.tensor(p4_dice, device=device, dtype=dtype),
+                torch.tensor(p5_dice, device=device, dtype=dtype),
+            ]
+        else:
+            # Full 15-length vector used in CAMTL (includes det breakdown)
+            vals = [
+                loss_det.detach(), loss_seg.detach(), cons_loss.detach(), align_loss.detach(), l2sp_term.detach(), total.detach(),
+                torch.tensor(det_box, device=device, dtype=dtype),
+                torch.tensor(det_cls, device=device, dtype=dtype),
+                torch.tensor(det_dfl, device=device, dtype=dtype),
+                torch.tensor(p3_bce, device=device, dtype=dtype),
+                torch.tensor(p4_bce, device=device, dtype=dtype),
+                torch.tensor(p5_bce, device=device, dtype=dtype),
+                torch.tensor(p3_dice, device=device, dtype=dtype),
+                torch.tensor(p4_dice, device=device, dtype=dtype),
+                torch.tensor(p5_dice, device=device, dtype=dtype),
+            ]
         loss_items = torch.stack(vals, dim=0)
         return total, loss_items
 
