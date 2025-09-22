@@ -27,6 +27,11 @@ LOSS:
   align_suppress: 0.05
   align_suppress_margin: 0.1
 
+  det_hyp:
+    box: 7.5
+    cls: 0.5
+    dfl: 1.5
+
 
 nc: 1
 scales:

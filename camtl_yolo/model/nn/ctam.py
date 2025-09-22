@@ -53,13 +53,36 @@ class CTAM(nn.Module):
             nn.SiLU(inplace=True),
         )
 
+    def _cache_spatial_key_attention(self, attn_weights: torch.Tensor, key_hw: tuple[int, int]) -> None:
+        """
+        attn_weights: [B, heads, Q, K] attention over K=Hk*Wk key positions.
+        Produces a single-channel spatial map over key positions: mean over heads and queries.
+        Stores to self.last_attn_map as [B,1,Hk,Wk] on the same device.
+        """
+        try:
+            B, Hh, Q, K = attn_weights.shape
+            Hk, Wk = int(key_hw[0]), int(key_hw[1])
+            m = attn_weights.mean(dim=(1, 2))  # [B, K]
+            m = m.reshape(B, 1, Hk, Wk)        # [B,1,Hk,Wk]
+            # keep as raw, non-normalized saliency; KL routine will normalize
+            self.last_attn_map = m
+        except Exception:
+            # on any mismatch, clear the cache to avoid stale tensors
+            self.last_attn_map = None
+
     def _attend(self, q_map: torch.Tensor, kv_map: torch.Tensor) -> torch.Tensor:
         """Run MHA(q, k=kv_map, v=kv_map) and return map [B, E, H, W]."""
         B, E, H, W = q_map.shape
         q = q_map.flatten(2).permute(0, 2, 1)  # [B, HW, E]
         k = kv_map.flatten(2).permute(0, 2, 1)  # [B, HW, E]
         v = k
-        out, _ = self.attn(q, k, v)            # [B, HW, E]
+        # Retrieve per-head attention weights to cache a spatial saliency map over key positions
+        Hk, Wk = kv_map.shape[-2], kv_map.shape[-1]
+        out, attn = self.attn(q, k, v, need_weights=True, average_attn_weights=False)  # [B, HW, E], [B, heads, Q, K]
+        # Cache mean attention over heads/queries reshaped to key spatial size
+        self._cache_spatial_key_attention(attn, key_hw=(Hk, Wk))
+        
+        # Return attended features in map form
         return out.permute(0, 2, 1).reshape(B, E, H, W)
 
     def forward(self, x) -> torch.Tensor:

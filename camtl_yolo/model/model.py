@@ -17,10 +17,10 @@ from camtl_yolo.external.ultralytics.ultralytics.utils import LOGGER
 from camtl_yolo.model.nn import CSAM, CTAM, FPMA, SegHeadMulti
 from camtl_yolo.model.losses import (
     DetectionLoss, 
-    DeepSupervisionBCEDiceLoss, 
-    ConsistencyMaskFromBoxes, 
+    DeepSupervisionConfigurableLoss, 
     build_alignment_loss,
-    L2SPRegularizer
+    L2SPRegularizer,
+    AttentionGuidanceKLLoss
     )
 from camtl_yolo.model.utils.normalization import replace_seg_stream_bn_with_groupnorm
 from camtl_yolo.model.utils.debug_cycles import assert_no_module_cycles
@@ -233,8 +233,7 @@ class CAMTL_YOLO(DetectionModel):
         Initialize CAMTL loss components on the model.
 
         Side effects:
-            - Sets `self.detect_criterion`, `self.segment_criterion`,
-            `self.consistency_criterion`, `self.align_criterion`
+            - Sets `self.detect_criterion`, `self.segment_criterion`, `self.align_criterion`
             - Sets scalar weights `_lambda_*`
             - Attaches picklable `_l2sp` object if enabled
         """
@@ -245,31 +244,42 @@ class CAMTL_YOLO(DetectionModel):
             det_hyp.setdefault(k, v)
 
         # Expose Ultralytics-style args if available
-        if not hasattr(self, "args"):
-            self.args = SimpleNamespace()
-        if isinstance(det_hyp, dict):
-            for k, v in det_hyp.items():
-                if not hasattr(self.args, k):
-                    setattr(self.args, k, v)
+        if det_hyp is None:
+            if not hasattr(self, "args"):
+                self.args = SimpleNamespace()
+            if isinstance(det_hyp, dict):
+                for k, v in det_hyp.items():
+                    if not hasattr(self.args, k):
+                        setattr(self.args, k, v)
 
         # Sub-criteria
         self.detect_criterion = DetectionLoss(self, hyp=det_hyp)
-        self.segment_criterion = DeepSupervisionBCEDiceLoss(
-            w_p3=float(cfg.get("w_p3", 1.0)),
-            w_p4=float(cfg.get("w_p4", 1.0)),
-            w_p5=float(cfg.get("w_p5", 1.0)),
+        self.segment_criterion = DeepSupervisionConfigurableLoss(  
+            config={
+                "p3": cfg.get("p3", ["BCE","DICE"]),
+                "p4": cfg.get("p4", ["BCE","DICE"]),
+                "p5": cfg.get("p5", ["BCE","DICE"]),
+            },
+            init_weights={
+                "p3": float(cfg.get("w_p3", 1.0)),
+                "p4": float(cfg.get("w_p4", 1.0)),
+                "p5": float(cfg.get("w_p5", 1.0)),
+            },
         )
-        self.consistency_criterion = ConsistencyMaskFromBoxes(
-            weight=float(cfg.get("consistency", 0.1)),
-            loss=str(cfg.get("consistency_loss", "bce")).lower(),
-        )
-        # NEW: alignment loss via factory, with on/off from YAML
+
         self.align_criterion = build_alignment_loss(cfg, model=self)
+
+        self.consistency_criterion = AttentionGuidanceKLLoss(
+            model=self,
+            weight=float(cfg.get("consistency", 1e-3)),
+            include_csam=bool(cfg.get("consistency_include_csam", True)),
+            eps=float(cfg.get("consistency_eps", 1e-8)),
+        )
 
         # Scalars
         self._lambda_det = float(cfg.get("lambda_det", 1.0))
         self._lambda_seg = float(cfg.get("lambda_seg", 1.0))
-        self._lambda_cons = float(cfg.get("lambda_cons", 0.1))
+        self._lambda_attn = float(cfg.get("lambda_attn", 0.1))
         self._lambda_align = float(cfg.get("lambda_align", 0.1))
         l2sp_lambda = float(cfg.get("lambda_l2sp", 0.0))
 
@@ -298,7 +308,7 @@ class CAMTL_YOLO(DetectionModel):
         """
         names = (
             # high-level scalars
-            "det", "seg", "cons", "align", "l2sp", "total",
+            "det", "seg", "attn_kl", "align", "l2sp", "total",
             # detection breakdown
             "box", "cls", "dfl",
             # segmentation breakdown (deep supervision)
@@ -318,7 +328,7 @@ class CAMTL_YOLO(DetectionModel):
             total: scalar tensor
             loss_items: 1D tensor of length 15 with the following order:
 
-            ("det","seg","cons","align","l2sp","total",
+            ("det","seg","attn_kl","align","l2sp","total",
             "box","cls","dfl",
             "p3_bce","p4_bce","p5_bce","p3_dice","p4_dice","p5_dice")
 
@@ -399,14 +409,6 @@ class CAMTL_YOLO(DetectionModel):
             except Exception as e:
                 LOGGER.warning(f"[loss] segmentation loss failed: {e}")
 
-        # ---- consistency ----
-        cons_loss = torch.zeros((), device=device, dtype=dtype)
-        try:
-            c_l, _ = self.consistency_criterion(seg_preds, batch)
-            cons_loss = c_l if c_l.ndim == 0 else c_l.sum()
-        except Exception as e:
-            LOGGER.warning(f"[loss] consistency loss failed: {e}")
-
         # ---- alignment (containment or CTAM), only meaningful if enabled in YAML ----
         align_loss = torch.zeros((), device=device, dtype=dtype)
         try:
@@ -414,6 +416,14 @@ class CAMTL_YOLO(DetectionModel):
             align_loss = a_l if a_l.ndim == 0 else a_l.sum()
         except Exception as e:
             LOGGER.warning(f"[loss] alignment loss failed: {e}")
+
+        # ---- AttnKL (attention guidance or fallback) ----
+        attn_kl = torch.zeros((), device=device, dtype=dtype)
+        try:
+            c_l, _ = self.consistency_criterion(seg_preds, batch)
+            attn_kl = c_l if c_l.ndim == 0 else c_l.sum()
+        except Exception as e:
+            LOGGER.warning(f"[loss] consistency loss failed: {e}")
 
         # ---- L2-SP ----
         l2sp_term = torch.zeros((), device=device, dtype=dtype)
@@ -427,7 +437,7 @@ class CAMTL_YOLO(DetectionModel):
         total = (
             self._lambda_det * loss_det
             + self._lambda_seg * loss_seg
-            + self._lambda_cons * cons_loss
+            + self._lambda_attn * attn_kl
             + self._lambda_align * align_loss
             + l2sp_term
         )
@@ -439,7 +449,7 @@ class CAMTL_YOLO(DetectionModel):
             vals = [
                 loss_det.detach(),
                 loss_seg.detach(),
-                cons_loss.detach(),
+                attn_kl.detach(),
                 align_loss.detach(),
                 l2sp_term.detach(),
                 total.detach(),
@@ -453,7 +463,7 @@ class CAMTL_YOLO(DetectionModel):
         else:
             # Full 15-length vector used in CAMTL (includes det breakdown)
             vals = [
-                loss_det.detach(), loss_seg.detach(), cons_loss.detach(), align_loss.detach(), l2sp_term.detach(), total.detach(),
+                loss_det.detach(), loss_seg.detach(), attn_kl.detach(), align_loss.detach(), l2sp_term.detach(), total.detach(),
                 torch.tensor(det_box, device=device, dtype=dtype),
                 torch.tensor(det_cls, device=device, dtype=dtype),
                 torch.tensor(det_dfl, device=device, dtype=dtype),
