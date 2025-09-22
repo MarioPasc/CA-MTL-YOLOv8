@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from pathlib import Path
 import yaml # type: ignore
-import types
+from types import SimpleNamespace
 
 # Ultralytics modules
 from camtl_yolo.external.ultralytics.ultralytics.nn.modules import (
@@ -19,10 +19,12 @@ from camtl_yolo.model.losses import (
     DetectionLoss, 
     DeepSupervisionBCEDiceLoss, 
     ConsistencyMaskFromBoxes, 
-    AttentionAlignmentLoss
+    build_alignment_loss,
+    L2SPRegularizer
     )
 from camtl_yolo.model.utils.normalization import replace_seg_stream_bn_with_groupnorm
 from camtl_yolo.model.utils.debug_cycles import assert_no_module_cycles
+
 
 def _find_idx(modules, cls):
     for i, m in enumerate(modules):
@@ -234,11 +236,8 @@ class CAMTL_YOLO(DetectionModel):
             - Sets `self.detect_criterion`, `self.segment_criterion`,
             `self.consistency_criterion`, `self.align_criterion`
             - Sets scalar weights `_lambda_*`
-            - Attaches `_l2sp` callable if enabled (anchors captured after pretrained load)
+            - Attaches picklable `_l2sp` object if enabled
         """
-        from types import SimpleNamespace
-        import torch
-
         cfg = self.yaml.get("LOSS", {}) if isinstance(self.yaml, dict) else {}
         det_hyp = cfg.get("det_hyp") or {}
         det_defaults = {"box": 7.5, "cls": 0.5, "dfl": 1.5}
@@ -264,12 +263,8 @@ class CAMTL_YOLO(DetectionModel):
             weight=float(cfg.get("consistency", 0.1)),
             loss=str(cfg.get("consistency_loss", "bce")).lower(),
         )
-        self.align_criterion = AttentionAlignmentLoss(
-            model=self,
-            source_name=str(cfg.get("source_domain", "retinography")),
-            target_name=str(cfg.get("target_domain", "angiography")),
-            weight=float(cfg.get("align", 0.1)),
-        )
+        # NEW: alignment loss via factory, with on/off from YAML
+        self.align_criterion = build_alignment_loss(cfg, model=self)
 
         # Scalars
         self._lambda_det = float(cfg.get("lambda_det", 1.0))
@@ -278,38 +273,23 @@ class CAMTL_YOLO(DetectionModel):
         self._lambda_align = float(cfg.get("lambda_align", 0.1))
         l2sp_lambda = float(cfg.get("lambda_l2sp", 0.0))
 
-        # ---- L2-SP: capture anchors after weights are loaded ----
-        # Include backbone+neck, exclude heads and attention by simple name filters.
-        def _l2sp_include(name: str) -> bool:
+        # ---- L2-SP anchors (picklable) ----
+        def _include(name: str) -> bool:
             skip_tags = (".cv2.", ".cv3.", ".dfl.", "SegHeadMulti", "CTAM", "CSAM", "FPMA", "Detect")
             return (not any(t in name for t in skip_tags))
 
         if l2sp_lambda > 0.0:
-            device = next(self.parameters()).device
             anchors: dict[str, torch.Tensor] = {}
             for n, p in self.named_parameters():
-                if p.requires_grad and _l2sp_include(n):
-                    anchors[n] = p.detach().clone().to(device=device, dtype=p.dtype)
-            # store once
-            self._l2sp_anchors = anchors
-
-            def _l2sp_fn(_self) -> torch.Tensor:
-                loss = torch.zeros((), device=device, dtype=torch.float32)
-                for n, ref in _self._l2sp_anchors.items():
-                    p = dict(_self.named_parameters()).get(n, None)
-                    if p is None:
-                        continue
-                    # squared deviation towards source reference
-                    loss = loss + torch.sum((p.float() - ref.float()) ** 2)
-                return loss * l2sp_lambda
-
-            self._l2sp = _l2sp_fn
+                if p.requires_grad and _include(n):
+                    anchors[n] = p.detach().clone()
+            # top-level, picklable object
+            self._l2sp = L2SPRegularizer(anchors=anchors, lam=l2sp_lambda)
         else:
             self._l2sp = None  # explicit
 
+
         # no return
-
-
 
     def _ensure_loss_reporting(self) -> None:
         """
@@ -419,7 +399,7 @@ class CAMTL_YOLO(DetectionModel):
             except Exception as e:
                 LOGGER.warning(f"[loss] segmentation loss failed: {e}")
 
-        # ---- Consistency and alignment (safe) ----
+        # ---- consistency ----
         cons_loss = torch.zeros((), device=device, dtype=dtype)
         try:
             c_l, _ = self.consistency_criterion(seg_preds, batch)
@@ -427,22 +407,22 @@ class CAMTL_YOLO(DetectionModel):
         except Exception as e:
             LOGGER.warning(f"[loss] consistency loss failed: {e}")
 
-        # alignment: only meaningful if both domains are present in the training regime
+        # ---- alignment (containment or CTAM), only meaningful if enabled in YAML ----
         align_loss = torch.zeros((), device=device, dtype=dtype)
         try:
-            # In CAMTL you only feed target-domain batches, so this will remain 0 unless you mix source.
-            a_l, _ = self.align_criterion(batch)
+            a_l, _ = self.align_criterion(seg_preds, det_preds, batch)  # new signature
             align_loss = a_l if a_l.ndim == 0 else a_l.sum()
         except Exception as e:
             LOGGER.warning(f"[loss] alignment loss failed: {e}")
 
-        # L2-SP
+        # ---- L2-SP ----
         l2sp_term = torch.zeros((), device=device, dtype=dtype)
         if getattr(self, "_l2sp", None) is not None:
             try:
-                l2sp_term = self._l2sp(self)
+                l2sp_term = self._l2sp(self)  # type: ignore
             except Exception as e:
                 LOGGER.warning(f"[loss] L2-SP failed: {e}")
+
         # ---- Total ----
         total = (
             self._lambda_det * loss_det

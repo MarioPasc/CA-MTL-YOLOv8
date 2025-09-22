@@ -12,6 +12,18 @@ TASK: CAMTL
 # CAMTL-specific hyperparameters
 LOSS:
   lambda_l2sp: 1e-4  # tune in {1e-5…1e-3}
+  # scalars
+  lambda_det: 1.0
+  lambda_seg: 1.0
+  lambda_cons: 0.1
+  lambda_align: 0.1
+
+  # alignment configuration
+  align_enable: true
+  align_mode: containment   # or 'ctam' to use the old stats matching
+  align: 0.1                # internal weight inside the alignment loss
+  align_margin: 0.7         # desired min avg vessel prob inside a det box
+  align_boxes: gt           # use 'gt' boxes for a stable signal
 
 nc: 1
 scales:
