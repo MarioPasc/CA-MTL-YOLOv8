@@ -11,19 +11,22 @@ TASK: CAMTL
 # Tasks: DomainShift1 (COCO-seg -> Retinography-seg); CAMTL (Retinography-seg -> Angiography: vessel-seg + stenosis-det);
 # CAMTL-specific hyperparameters
 LOSS:
-  lambda_l2sp: 1e-4  # tune in {1e-5…1e-3}
-  # scalars
   lambda_det: 1.0
   lambda_seg: 1.0
   lambda_cons: 0.1
   lambda_align: 0.1
+  lambda_l2sp: 1e-4        # >0 to enable anti-forgetting
 
-  # alignment configuration
   align_enable: true
-  align_mode: containment   # or 'ctam' to use the old stats matching
-  align: 0.1                # internal weight inside the alignment loss
-  align_margin: 0.7         # desired min avg vessel prob inside a det box
-  align_boxes: gt           # use 'gt' boxes for a stable signal
+  align_contain_enable: true
+  align_contain: 0.1
+  align_margin: 0.7
+  align_boxes: gt
+
+  align_suppress_enable: true
+  align_suppress: 0.05
+  align_suppress_margin: 0.1
+
 
 nc: 1
 scales:

@@ -1,248 +1,259 @@
+"""
+Alignment losses for multi-task learning between detection and segmentation.
+
+This module provides small, plug-and-play losses that couple the behavior of
+the detection and segmentation heads during training:
+
+- ZeroStenosisSuppressionLoss: On segmentation batches (i.e., batches used to
+  train the segmentation branch where we don't expect detections), suppress
+  spurious detection logits by enforcing a small per-image max class score.
+
+- VesselContainmentAlignLoss: On detection batches (i.e., batches used to
+  train the detection branch), encourage detected objects (e.g., stenosis) to
+  lie within the vessel mask predicted by the segmentation branch by maximizing
+  mask coverage within each ROI.
+
+- CompositeAlignmentLoss: A thin wrapper that combines both behaviors, running
+  each loss on its respective batch type and summing the results.
+
+All losses return a tuple of (loss, logs_dict) to integrate seamlessly with the
+training loop and metrics logging.
+"""
 # camtl_yolo/model/losses/align.py
 from __future__ import annotations
-from typing import Dict, List, Tuple, Union, Optional
+from typing import Dict, List, Tuple, Union, Optional, cast, Callable
 import weakref
 import torch
 import torch.nn as nn
 from camtl_yolo.model.nn import CTAM
 
-# ADD this new class near the top-level of align.py
+class ZeroStenosisSuppressionLoss(nn.Module):
+    """
+    Suppress detection logits on segmentation batches.
+
+    Intended for multi-task training where some batches optimize segmentation
+    only (no positive detection targets expected). On such batches, this loss
+    penalizes the maximum predicted detection class probability per image if it
+    rises above a margin, discouraging spurious detections on negative or
+    segmentation-only data.
+
+    Args:
+        nc: Number of detection classes (C). Used to select the classification
+            slice from detection predictions when layout includes extra channels
+            (e.g., box/obj + cls).
+        weight: Scalar multiplier applied to the computed loss.
+        margin: Allowed per-image maximum class probability without penalty.
+
+    Expected inputs to forward:
+        det_preds: Either
+            - Tensor of shape [B, A, C_total], or
+            - List/tuple of pyramid tensors. Each tensor may be
+              [B, A_i, C_total] or [B, H_i, W_i, C_total]; in the latter case,
+              anchors A_i = H_i * W_i. Tensors are flattened and concatenated
+              along the anchors dimension to shape [B, sum(A_i), C_total].
+        batch: Dict containing at least:
+            - "img": Tensor with device/shape context [B, C, H, W].
+            - "is_seg": Bool or tensor-like flag; True indicates a segmentation
+              batch and activates this loss. When False, the loss returns 0.
+
+    Returns:
+        Tuple[Tensor, Dict[str, Tensor]]: A scalar loss tensor and a logging
+        dictionary with key "align_suppress" containing a detached copy.
+
+    Notes:
+        - If the predictions don't expose at least `nc` class channels in the
+          last dimension, the loss is a no-op (returns 0).
+        - The loss is inactive on non-segmentation batches.
+    """
+    __slots__ = ("nc","weight","margin")
+    def __init__(self, nc:int, weight:float=0.05, margin:float=0.1):
+        super().__init__(); self.nc=int(nc); self.weight=float(weight); self.margin=float(margin)
+    @staticmethod
+    def _is_seg(batch:dict)->bool:
+        """Return True if the current batch should be treated as a segmentation batch."""
+        return bool(torch.as_tensor(batch.get("is_seg", False)).any().item())
+    @staticmethod
+    def _stack_preds(p):  # -> [B, A, C]
+        """
+        Flatten and concatenate multi-scale detection predictions.
+
+        Accepts either a single tensor [B, A, C] or [B, H, W, C], or a list of
+        such tensors for pyramid outputs. 4D tensors are reshaped to [B, H*W, C]
+        before concatenation along anchors A.
+        """
+        if isinstance(p,(list,tuple)):
+            parts=[]; 
+            for t in p: parts.append(t.reshape(t.shape[0], -1, t.shape[-1]) if t.ndim==4 else t)
+            return torch.cat(parts,1)
+        return p.reshape(p.shape[0], -1, p.shape[-1]) if p.ndim==4 else p
+    def forward(self, det_preds, batch):
+        """Compute suppression loss for segmentation batches.
+
+        The loss penalizes per-image max class probability above `margin`:
+
+            loss = weight * mean(relu(max_prob_per_image - margin))
+
+        Args:
+            det_preds: Detection predictions (see class docstring).
+            batch: Training batch dict (must include "img"; uses "is_seg").
+
+        Returns:
+            loss: Scalar tensor.
+            logs: {"align_suppress": detached loss}
+        """
+        dev = batch["img"].device
+        if not self._is_seg(batch) or self.weight<=0: z=torch.zeros((),device=dev); return z,{"align_suppress":z}
+        P = self._stack_preds(det_preds)
+        if P.shape[-1] < self.nc: z=torch.zeros((),device=dev); return z,{"align_suppress":z}
+        cls_prob = P[..., -self.nc:].sigmoid()             # [B,A,nc]
+        per_img_max = cls_prob.amax(dim=(1,2))             # [B]
+        loss = self.weight * torch.relu(per_img_max - self.margin).mean()
+        return loss, {"align_suppress": loss.detach()}
 
 class VesselContainmentAlignLoss(nn.Module):
     """
-    Penalize detections that lie outside the predicted vessel mask.
-    Only active on detection batches. Gradients flow to the segmentation stream.
+    Encourage detections to lie within the vessel segmentation.
 
-    Config:
-      - weight: global scalar applied to the penalty
-      - margin: desired minimum average mask probability inside a box (e.g., 0.7)
-      - box_source: 'gt' (default) uses ground-truth boxes; 'pred' would need decoded det boxes (not recommended)
-      - upsample_to: spatial size to upsample the seg map to; defaults to batch['img'] size
+    On detection batches, this loss samples the segmentation probabilities
+    within Regions of Interest (ROIs) derived from ground-truth (or other
+    sources in the future) and penalizes low coverage. Intuitively, a stenosis
+    detection should be contained by the vessel mask.
+
+    Args:
+        weight: Scalar multiplier for the loss.
+        margin: Desired minimum vessel coverage in each ROI; lower coverage is
+            penalized with ReLU(margin - coverage).
+        box_source: Source for ROIs. Currently "gt" is supported; hooks exist
+            for future extensions (e.g., "pred").
+
+    Expected inputs to forward:
+        seg_preds: Segmentation logits tensor or dict. If dict, the first
+            available tensor among {"full", "p3", "p4", "p5"} is used. Shape
+            should be [B, C_seg=1, H, W]. If spatial size doesn't match the
+            batch image size, it is bilinearly resized.
+        det_preds: Unused at the moment; present for API symmetry.
+        batch: Dict with keys:
+            - "img": Tensor [B, C, H, W] used to infer spatial size and device.
+            - "bboxes": Tensor [N, 4] in normalized XYWH format.
+            - "batch_idx": Tensor [N] with image indices for each bbox.
+
+    Returns:
+        Tuple[Tensor, Dict[str, Tensor]] with keys:
+            - loss: Scalar loss = weight * mean(relu(margin - coverage)).
+            - logs: {"align_contain": detached loss}.
     """
-    __slots__ = ("weight", "margin", "box_source", "upsample_to")
-
-    def __init__(self, weight: float = 0.1, margin: float = 0.7,
-                 box_source: str = "gt", upsample_to: str = "img") -> None:
-        super().__init__()
-        self.weight = float(weight)
-        self.margin = float(margin)
-        self.box_source = str(box_source)
-        self.upsample_to = str(upsample_to)
-
+    __slots__=("weight","margin","box_source")
+    def __init__(self, weight:float=0.1, margin:float=0.7, box_source:str="gt"):
+        super().__init__(); self.weight=float(weight); self.margin=float(margin); self.box_source=str(box_source)
     @staticmethod
-    def _pick_seg_map(seg_preds: dict | torch.Tensor | None) -> torch.Tensor | None:
-        if seg_preds is None:
+    def _pick_seg(seg):
+        """Select a usable segmentation tensor from various container types."""
+        if seg is None: return None
+        if isinstance(seg,dict):
+            for k in ("full","p3","p4","p5"):
+                v=seg.get(k,None)
+                if torch.is_tensor(v): return v
             return None
-        if isinstance(seg_preds, dict):
-            # prefer full-resolution fused map if present
-            if "full" in seg_preds and torch.is_tensor(seg_preds["full"]):
-                return seg_preds["full"]
-            # otherwise fall back to P3
-            if "p3" in seg_preds and torch.is_tensor(seg_preds["p3"]):
-                return seg_preds["p3"]
-            # any single tensor-valued entry
-            for v in seg_preds.values():
-                if torch.is_tensor(v):
-                    return v
-            return None
-        return seg_preds if torch.is_tensor(seg_preds) else None
-
+        return seg if torch.is_tensor(seg) else None
     @torch.no_grad()
-    def _gt_rois_xyxy(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+    def _gt_rois(self, batch):
         """
-        Build ROI tensor [N, 5] = [batch_idx, x1, y1, x2, y2] in pixel space from
-        normalized XYWH targets in `batch['bboxes']` and per-box `batch_idx`.
+        Build ROIs from ground-truth boxes in the batch.
+
+        Expects normalized XYWH boxes in `batch["bboxes"]` and indices in
+        `batch["batch_idx"]`. Converts to absolute XYXY and returns a tensor of
+        shape [M, 5] where each row is [batch_index, x1, y1, x2, y2].
         """
-        if ("bboxes" not in batch) or ("batch_idx" not in batch):
-            return torch.zeros((0, 5), device=batch["img"].device)
-
-        bxywh = batch["bboxes"]  # normalized xywh
-        bi = batch["batch_idx"].to(dtype=torch.float32)
-        if bxywh.numel() == 0:
-            return torch.zeros((0, 5), device=batch["img"].device)
-
-        # image size in pixels
-        _, _, H, W = batch["img"].shape
-        scale = torch.tensor([W, H, W, H], device=bxywh.device, dtype=bxywh.dtype)
+        if "bboxes" not in batch or "batch_idx" not in batch: 
+            return torch.zeros((0,5), device=batch["img"].device)
+        xywh = batch["bboxes"]; bi = batch["batch_idx"].to(dtype=torch.float32)
+        if xywh.numel()==0: return torch.zeros((0,5), device=batch["img"].device)
+        H,W = batch["img"].shape[-2:]
         from camtl_yolo.external.ultralytics.ultralytics.utils import ops as ULops
-        xyxy = ULops.xywh2xyxy(bxywh) * scale
-        rois = torch.cat([bi.unsqueeze(1), xyxy], dim=1)  # [N,5]
-        return rois
+        # Ensure type stability for static analyzers; UL returns Tensor at runtime.
+        xyxy = cast(torch.Tensor, ULops.xywh2xyxy(xywh)) * torch.tensor([W, H, W, H], device=xywh.device, dtype=xywh.dtype)
+        return torch.cat([bi[:, None], xyxy], 1)
+    def forward(self, seg_preds, det_preds, batch):
+        """Compute containment loss on detection batches.
 
-    def forward(self, seg_preds: dict | torch.Tensor | None,
-                det_preds: torch.Tensor | None,
-                batch: dict) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        Steps:
+        1. Skip if not a detection batch or no usable segmentation available.
+        2. Resize seg logits to the image size and apply sigmoid to get probs.
+        3. Build ROIs (currently from ground-truth boxes).
+        4. Use ROI Align to sample a 1x1 pooled coverage per ROI.
+        5. Penalize coverage below `margin`.
+
+        Returns a tuple (loss, {"align_contain": detached loss}).
         """
-        seg_preds: dict/tensor from SegHeadMulti
-        det_preds: unused here (we rely on GT by default)
-        batch: training batch dict with 'img', 'is_seg'/'is_det', 'bboxes', 'batch_idx'
-        """
-        device = batch["img"].device
-        # Only run on detection batches
-        is_det = bool(torch.as_tensor(batch.get("is_det", False)).any().item())
-        if not is_det or self.weight <= 0.0:
-            z = torch.zeros((), device=device)
-            return z, {"align_loss": z}
+        dev = batch["img"].device
+        is_det = not bool(torch.as_tensor(batch.get("is_seg", False)).any().item())
+        if not is_det or self.weight<=0: z=torch.zeros((),device=dev); return z,{"align_contain":z}
+        seg = self._pick_seg(seg_preds)
+        if seg is None: z=torch.zeros((),device=dev); return z,{"align_contain":z}
+        size = batch["img"].shape[-2:]
+        if seg.shape[-2:]!=size: seg = torch.nn.functional.interpolate(seg.float(), size=size, mode="bilinear", align_corners=False)
+        prob = seg.sigmoid()
+        rois = self._gt_rois(batch)
+        if rois.numel()==0: z=torch.zeros((),device=dev); return z,{"align_contain":z}
+        import torchvision.ops as tv_ops
+        roi_align_fn: Callable[..., torch.Tensor] = getattr(tv_ops, "roi_align")
+        coverage = roi_align_fn(prob, rois, output_size=(1,1), spatial_scale=1.0, aligned=True).view(-1)
+        loss = self.weight * torch.relu(self.margin - coverage).mean()
+        return loss, {"align_contain": loss.detach()}
 
-        seg = self._pick_seg_map(seg_preds)
-        if seg is None:
-            z = torch.zeros((), device=device)
-            return z, {"align_loss": z}
-
-        # upsample seg logits/prob to input resolution
-        target_hw = batch["img"].shape[-2:]
-        if seg.shape[-2:] != target_hw:
-            seg = torch.nn.functional.interpolate(seg.float(), size=target_hw, mode="bilinear", align_corners=False)
-        # use probabilities, not hard mask
-        seg_prob = seg.sigmoid()  # [B,1,H,W] expected # type: ignore
-
-        # choose boxes
-        if self.box_source != "gt":
-            # Decoding det predictions in training graph would require custom decode; not advised here.
-            # Fall back to GT to keep a clean gradient path to the seg stream.
-            raise NotImplementedError("VesselContainmentAlignLoss(box_source='pred') is not implemented. Use 'gt'.")
-
-        rois = self._gt_rois_xyxy(batch)  # [N,5]
-        if rois.numel() == 0:
-            z = torch.zeros((), device=device)
-            return z, {"align_loss": z}
-
-        # differentiable average mask prob inside each ROI via ROIAlign
-        from torchvision.ops import roi_align  # type: ignore[import]
-        # seg_prob must be [B, C=1, H, W]; roi_align returns [N, 1, 1, 1]
-        pooled = roi_align(seg_prob, rois, output_size=(1, 1), spatial_scale=1.0, aligned=True)
-        coverage = pooled.view(-1)  # [N] in [0,1]
-
-        # hinge penalty towards margin
-        per_box = torch.relu(self.margin - coverage)
-        loss = self.weight * per_box.mean()
-        return loss, {"align_loss": loss.detach()}
-
-
-def build_alignment_loss(cfg: dict, model: nn.Module) -> nn.Module:
+class CompositeAlignmentLoss(nn.Module):
     """
-    Factory for alignment losses.
+    Containment on detection batches + suppression on segmentation batches.
 
-    YAML options under LOSS:
-      align_enable: bool
-      align_mode: 'containment' | 'ctam'
-      align: float                       # global weight used inside each loss
-      align_margin: float                # for 'containment'
-      align_boxes: 'gt' | 'pred'         # for 'containment'
-      source_domain / target_domain      # for 'ctam'
+    This wrapper keeps each sub-loss active only on the appropriate batch type
+    and aggregates the results. Any missing component is treated as a no-op.
+
+    Args:
+        contain: Module implementing the containment loss on detection batches.
+        suppress: Module implementing the suppression loss on segmentation batches.
+
+    Returns (forward):
+        Tuple[Tensor, Dict[str, Tensor]] with the summed loss and a merged logs
+        dictionary that includes "align_loss" as the detached total.
     """
-    enable = bool(cfg.get("align_enable", True))
-    if not enable:
-        # no-op module
-        return nn.Identity()
+    def __init__(self, contain:Optional[nn.Module], suppress:Optional[nn.Module]): 
+        super().__init__(); self.contain=contain; self.suppress=suppress
+    def forward(self, seg_preds, det_preds, batch):
+        dev = batch["img"].device; z=torch.zeros((),device=dev); logs={}
+        lc, ls = z, z
+        if self.contain is not None: lc, ic = self.contain(seg_preds, det_preds, batch); logs.update(ic)
+        if self.suppress is not None: ls, is_ = self.suppress(det_preds, batch); logs.update(is_)
+        loss = lc + ls; logs["align_loss"] = loss.detach(); return loss, logs
 
-    mode = str(cfg.get("align_mode", "containment")).lower()
-    w = float(cfg.get("align", 0.1))
-    if mode == "containment":
-        return VesselContainmentAlignLoss(
-            weight=w,
-            margin=float(cfg.get("align_margin", 0.7)),
-            box_source=str(cfg.get("align_boxes", "gt")),
-        )
-    else:
-        # keep your existing CTAM statistics matching as fallback
-        return AttentionAlignmentLoss(
-            model=model,
-            source_name=str(cfg.get("source_domain", "retinography")),
-            target_name=str(cfg.get("target_domain", "angiography")),
-            weight=w,
-        )
-
-
-ProxyLike = Union[weakref.ProxyType, weakref.CallableProxyType]
-
-def _collect_ctam_attn(root: nn.Module) -> List[torch.Tensor]:
-    atts: List[torch.Tensor] = []
-    for m in root.modules():
-        if isinstance(m, CTAM):
-            att = getattr(m, "last_attn", None)
-            if isinstance(att, torch.Tensor):
-                atts.append(att)
-    return atts
-
-class AttentionAlignmentLoss(nn.Module):
+def build_alignment_loss(cfg:dict, model:nn.Module)->nn.Module:
     """
-    Aligns CTAM attention statistics across domains.
-    Holds ONLY a weak proxy to the parent. Never registers it as a child.
+    Factory for alignment losses controlled by a config dict.
+
+    Config keys (all optional with defaults):
+        align_enable (bool, default True): Enable alignment losses globally.
+        align_contain_enable (bool, default True): Enable containment loss.
+        align_suppress_enable (bool, default True): Enable suppression loss.
+        align (float, default 0.1): Default weight if align_contain not provided.
+        align_contain (float): Containment loss weight (overrides `align`).
+        align_margin (float, default 0.7): Minimum desired ROI coverage.
+        align_boxes (str, default "gt"): Source for boxes (currently "gt").
+        align_suppress (float, default 0.05): Suppression loss weight.
+        align_suppress_margin (float, default 0.1): Allowed max cls prob on seg batches.
+        nc (int): Number of detection classes; falls back to `model.nc` if present.
+
+    Returns:
+        nn.Module: Either an nn.Identity (when disabled) or a CompositeAlignmentLoss
+        possibly wrapping one or both component losses.
     """
-
-    __slots__ = ("_model_ref", "source_name", "target_name", "weight", "_warned")
-
-    def __init__(
-        self,
-        model: Union[nn.Module, ProxyLike],
-        source_name: str = "retinography",
-        target_name: str = "angiography",
-        weight: float = 0.1,
-    ) -> None:
-        super().__init__()
-
-        # 1) hard purge if these names were ever registered as children
-        for k in ("model", "_model_ref"):
-            if k in self._modules:  # type: ignore[attr-defined]
-                del self._modules[k]  # break stale back-edge
-
-        # 2) store weak proxy via object.__setattr__ to bypass registration
-        if isinstance(model, (weakref.ProxyType, weakref.CallableProxyType)):
-            proxy = model
-        elif isinstance(model, nn.Module):
-            proxy = weakref.proxy(model)
-        else:
-            proxy = model  # for tests only
-
-        object.__setattr__(self, "_model_ref", proxy)
-
-        self.source_name = str(source_name)
-        self.target_name = str(target_name)
-        self.weight = float(weight)
-        self._warned = False
-
-    # 3) forbid future registrations under forbidden names
-    def __setattr__(self, name: str, value) -> None:
-        if name in {"model", "_model_ref"} and isinstance(value, nn.Module):
-            raise TypeError(f"Refusing to register Module under '{name}' to avoid cycles.")
-        return super().__setattr__(name, value)
-
-    # read-only accessor; returns proxy, NOT a Module child
-    @property
-    def model(self) -> object:
-        return object.__getattribute__(self, "_model_ref")
-
-
-    def forward(self, seg_preds: dict | torch.Tensor | None,
-                det_preds: torch.Tensor | None,
-                batch: Dict[str, torch.Tensor | list]) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """
-        Expects batch['img'] (tensor) and batch['domain'] (list[str]).
-        """
-        device = batch["img"].device # type: ignore[union-attr]
-        atts = _collect_ctam_attn(self.model)  # type: ignore[attr-defined]
-        if not atts:
-            if not self._warned:
-                self._warned = True
-            z = torch.zeros((), device=device)
-            return z, {"align_loss": z}
-
-        per_module_means: List[torch.Tensor] = []
-        for att in atts:
-            per_module_means.append(att.float().mean(dim=tuple(range(1, att.ndim))))  # [B]
-
-        mean_att = torch.stack(per_module_means, dim=0).mean(dim=0)  # [B]
-        domains = batch["domain"]
-
-        src_mask = torch.tensor([d == self.source_name for d in domains], device=device, dtype=torch.bool)
-        tgt_mask = torch.tensor([d == self.target_name for d in domains], device=device, dtype=torch.bool)
-
-        if not src_mask.any() or not tgt_mask.any():
-            z = torch.zeros((), device=device)
-            return z, {"align_loss": z}
-
-        src_mean = mean_att[src_mask].mean()
-        tgt_mean = mean_att[tgt_mask].mean()
-        loss = self.weight * (src_mean - tgt_mean).pow(2)
-        return loss, {"align_loss": loss.detach()}
+    if not bool(cfg.get("align_enable", True)): return nn.Identity()
+    contain = VesselContainmentAlignLoss(
+        weight=float(cfg.get("align_contain", cfg.get("align", 0.1))),
+        margin=float(cfg.get("align_margin", 0.7)),
+        box_source=str(cfg.get("align_boxes", "gt")),
+    ) if bool(cfg.get("align_contain_enable", True)) else None
+    suppress = ZeroStenosisSuppressionLoss(
+        nc=int(getattr(model,"nc", cfg.get("nc",1))),
+        weight=float(cfg.get("align_suppress", 0.05)),
+        margin=float(cfg.get("align_suppress_margin", 0.1)),
+    ) if bool(cfg.get("align_suppress_enable", True)) else None
+    return nn.Identity() if (contain is None and suppress is None) else CompositeAlignmentLoss(contain, suppress)
