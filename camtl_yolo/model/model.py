@@ -3,7 +3,7 @@ import torch.nn as nn
 from pathlib import Path
 import yaml # type: ignore
 from types import SimpleNamespace
-from torch.cuda.amp import autocast
+from torch.amp import autocast
 
 # Ultralytics modules
 from camtl_yolo.external.ultralytics.ultralytics.nn.modules import (
@@ -400,7 +400,7 @@ class CAMTL_YOLO(DetectionModel):
         if has_seg:
             try:
                 # Compute segmentation loss in FP32 to avoid AMP half-precision overflows
-                with autocast(enabled=False):
+                with autocast("cuda", enabled=False):
                     seg_inputs = seg_preds
                     if isinstance(seg_preds, dict):
                         seg_inputs = {k: (v.float() if torch.is_tensor(v) else v) for k, v in seg_preds.items()}
@@ -496,7 +496,11 @@ class CAMTL_YOLO(DetectionModel):
         Save a task-aware checkpoint:
           - DomainShift1 -> yolov8{SCALE}-domainshift1.pt
           - CAMTL       -> yolov8{SCALE}-camtl.pt
-        Stores an Ultralytics-compatible dict with 'model' = this Module.
+
+        Implementation notes:
+          - Avoid pickling the live Module (which may hold non-picklable refs like weakref in criteria).
+          - Save only a state_dict and lightweight metadata instead.
+          - Do not mutate this model's dtype/device during save.
         """
         save_dir = Path(save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
@@ -505,10 +509,12 @@ class CAMTL_YOLO(DetectionModel):
             suffix = "domainshift1" if self.task == "DomainShift1" else "camtl" if self.task == "CAMTL" else "custom"
             filename = f"yolov8{self.scale}-{suffix}.pt"
 
+        # Collect a CPU-FP32 copy of the state_dict without mutating the live model
+        sd = {k: v.detach().to(dtype=torch.float32, device="cpu") for k, v in self.state_dict().items()}
         ckpt = {
-            "model": self.float(),  # store in FP32 for portability
+            "model": sd,  # state_dict only
             "epoch": int(epoch or 0),
-            "optimizer": (optimizer.state_dict() if optimizer is not None else None),
+            "optimizer": None,  # keep ckpt lean; training resumes via Ultralytics flow
             "yaml": self.yaml,
             "args": {"task": self.task, "scale": self.scale},
             "extra": extra or {},

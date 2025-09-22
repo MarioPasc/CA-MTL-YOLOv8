@@ -361,7 +361,6 @@ class CAMTLTrainer(BaseTrainer):
 
     def final_eval(self):
         """Evaluate using our task-aware checkpoint (DomainShift1/CAMTL) so criteria exist."""
-
         # 1) Save a fresh task checkpoint to guarantee it exists
         task_ckpt_path: Path | None = None
         try:
@@ -372,22 +371,27 @@ class CAMTLTrainer(BaseTrainer):
         except Exception as e:
             LOGGER.warning(f"[final_eval] save_task_checkpoint failed: {e}")
 
-        # 2) Load task checkpoint as a MODULE and attach criteria
+        # 2) Load task checkpoint weights into a fresh model instance
         val_model = None
         if task_ckpt_path and task_ckpt_path.exists():
-            ckpt = torch.load(task_ckpt_path, map_location=self.device, weights_only=False)
-            if isinstance(ckpt, dict) and "model" in ckpt and hasattr(ckpt["model"], "state_dict"):
-                val_model = ckpt["model"]
-            elif hasattr(ckpt, "state_dict"):
-                val_model = ckpt  # already a nn.Module
-            else:
-                # Fallback: rebuild model and load state_dict from ckpt["model"]
+            try:
+                ckpt = torch.load(task_ckpt_path, map_location="cpu", weights_only=False)
                 from camtl_yolo.model.model import CAMTL_YOLO
                 val_model = CAMTL_YOLO(cfg=self.model.yaml, ch=self.data["channels"], nc=self.data["nc"], verbose=False)
-                sd = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
-                if isinstance(sd, dict):
-                    val_model.load_state_dict(sd, strict=False)
-            val_model = None
+                if isinstance(ckpt, dict) and isinstance(ckpt.get("model"), dict):
+                    val_model.load_state_dict(ckpt["model"], strict=False)
+                elif isinstance(ckpt, dict) and hasattr(ckpt.get("model", None), "state_dict"):
+                    val_model.load_state_dict(ckpt["model"].state_dict(), strict=False)
+                elif hasattr(ckpt, "state_dict"):
+                    val_model.load_state_dict(ckpt.state_dict(), strict=False)
+                else:
+                    # assume raw state_dict
+                    val_model.load_state_dict(ckpt, strict=False)
+            except Exception as e:
+                LOGGER.warning(f"[final_eval] loading model for validation failed: {e}")
+                val_model = None
+
+        if val_model is None:
             return
 
         # 4) Prepare module for validation and ensure criteria are attached
@@ -405,8 +409,6 @@ class CAMTLTrainer(BaseTrainer):
             LOGGER.warning(f"[final_eval] init_criterion on task model failed: {e}")
 
         val_model.to(self.device)
-        use_half = (self.device.type == "cuda") and bool(self.amp)
-        val_model = val_model.half() if use_half else val_model.float()
         base.eval()
 
         # 5) Validate with the MODULE (not a Path)
@@ -421,12 +423,56 @@ class CAMTLTrainer(BaseTrainer):
     # ------------------------ Save Hook ------------------------ #
 
     def save_model(self):
-        """Augment BaseTrainer saving with task-aware checkpoint."""
-        super().save_model()
+        """Custom, robust checkpoint saving without deepcopy/half casts.
+
+        Writes:
+          - weights/last.pt  : CPU-FP32 state_dict + minimal metadata
+          - weights/best.pt  : when fitness improves
+          - task-aware ckpt  : yolov8{scale}-{suffix}.pt via model.save_task_checkpoint()
+        """
+        base = unwrap_model(self.model)
         try:
-            unwrap_model(self.model).save_task_checkpoint(self.wdir, epoch=self.epoch, optimizer=self.optimizer)
+            sd = {k: v.detach().float().cpu() for k, v in base.state_dict().items()}
+            ema_sd = None
+            try:
+                ema_sd = self.ema.ema.state_dict() if hasattr(self, "ema") and hasattr(self.ema, "ema") else None
+                if isinstance(ema_sd, dict):
+                    ema_sd = {k: v.detach().float().cpu() for k, v in ema_sd.items()}
+            except Exception:
+                ema_sd = None
+
+            payload = {
+                "epoch": int(self.epoch),
+                "best_fitness": float(getattr(self, "best_fitness", 0.0)),
+                "fitness": float(getattr(self, "fitness", 0.0)),
+                "model": sd,
+                "ema": ema_sd,
+                "optimizer": None,
+                "train_args": dict(getattr(self, "args", {})),
+            }
+
+            # last.pt
+            out_last = self.wdir / "last.pt"
+            torch.save(payload, out_last)
+            LOGGER.info(f"[save_model] Wrote checkpoint: {out_last}")
+
+            # best.pt
+            try:
+                if float(getattr(self, "best_fitness", -1.0)) == float(getattr(self, "fitness", -2.0)):
+                    out_best = self.wdir / "best.pt"
+                    torch.save(payload, out_best)
+                    LOGGER.info(f"[save_model] Updated best checkpoint: {out_best}")
+            except Exception:
+                pass
+
         except Exception as e:
-            LOGGER.warning(f"Task checkpoint save failed: {e}")
+            LOGGER.warning(f"[save_model] Writing last/best failed: {e}")
+
+        # Task-aware checkpoint (always attempt once)
+        try:
+            base.save_task_checkpoint(self.wdir, epoch=self.epoch, optimizer=self.optimizer)
+        except Exception as e:
+            LOGGER.warning(f"[save_model] Task checkpoint save failed: {e}")
 
     # ------------------------ Metrics persistence & plots ------------------------ #
 

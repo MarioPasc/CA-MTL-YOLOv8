@@ -5,6 +5,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from camtl_yolo.model.losses.lovasz_losses import lovasz_hinge as lovasz_hinge_bin  # binary
+
+
 class DiceLossProb(nn.Module):
     """Soft Dice on probabilities. NaN-safe."""
     def __init__(self, eps: float = 1e-6) -> None:
@@ -12,7 +14,9 @@ class DiceLossProb(nn.Module):
         self.eps = eps
 
     def forward(self, p: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        # sanitize
+        # sanitize (keep in float32 for numerical headroom under AMP)
+        p = p.float()
+        y = y.float()
         p = torch.nan_to_num(p, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0, 1)
         y = torch.nan_to_num(y, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0, 1)
         inter = (p * y).sum(dim=(1, 2, 3))
@@ -61,10 +65,10 @@ class DeepSupervisionConfigurableLoss(nn.Module):
         # sanitize targets
         if torch.is_floating_point(tgt) and tgt.max() > 1.5:
             tgt = (tgt / 255.0).clamp_(0, 1)
-        tgt = torch.nan_to_num(tgt, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0, 1)
+        tgt = torch.nan_to_num(tgt, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0, 1).float()
 
         # sanitize logits before any op
-        logit = torch.nan_to_num(logit, nan=0.0, posinf=20.0, neginf=-20.0).clamp_(-20.0, 20.0)
+        logit = torch.nan_to_num(logit, nan=0.0, posinf=20.0, neginf=-20.0).clamp_(-20.0, 20.0).float()
         prob = torch.sigmoid(logit)
 
         comps: dict[str, torch.Tensor] = {}
@@ -84,13 +88,14 @@ class DeepSupervisionConfigurableLoss(nn.Module):
     def forward(self, preds: dict[str, torch.Tensor], batch: dict) -> tuple[torch.Tensor, dict[str, float]]:
         # total starts as finite scalar on the right device
         dev = (preds["p3"].device if isinstance(preds, dict) and "p3" in preds else batch["img"].device)
-        total = torch.zeros((), device=dev)
+        total = torch.zeros((), device=dev, dtype=torch.float32)
         items: dict[str, float] = {}
 
         for key in ("p3", "p4", "p5"):
             if not (isinstance(preds, dict) and key in preds):
                 continue
             logit = preds[key]
+            logit = logit.float()
             h, w = logit.shape[-2:]
             tgt = batch.get(f"mask_{key}", None)
             if tgt is None:
@@ -104,8 +109,9 @@ class DeepSupervisionConfigurableLoss(nn.Module):
                 continue
 
             # sum components for this scale
-            loss_s = torch.stack([v if v.ndim == 0 else v.mean() for v in comps.values()]).sum()
-            w_s = F.softplus(self._alpha[key]).clamp(1e-6, 1e6)  # positive and bounded
+            loss_s = torch.stack([v if v.ndim == 0 else v.mean() for v in comps.values()]).sum().float()
+            # Keep weights in a safe dynamic range for FP16 checkpoints (~6e4 max)
+            w_s = F.softplus(self._alpha[key]).clamp(1e-6, 6e4).float()
             total = total + (w_s * loss_s)
 
             # expose components
@@ -116,6 +122,6 @@ class DeepSupervisionConfigurableLoss(nn.Module):
         items.update(self.get_weights())
         items["seg_loss"] = float(torch.nan_to_num(total.detach(), nan=0.0))
         # final guard
-        total = torch.nan_to_num(total, nan=0.0, posinf=1e6, neginf=1e6)
+        total = torch.nan_to_num(total, nan=0.0, posinf=1e4, neginf=1e4).float()
         return total, items
 

@@ -35,7 +35,7 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/MarioPasc/CA-MLT-YOLOv8"
+Homepage = "https://github.com/MarioPasc/CA-MTL-YOLOv8"
 
 # NOTE: We vendor a modified copy of the ultralytics package (top-level 'ultralytics/' directory).
 # To ensure it is installed together with CA-MLT-YOLO (and preferred on sys.path over any PyPI ultralytics),

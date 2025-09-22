@@ -73,11 +73,11 @@ class CAMTLValidator(BaseValidator):
             if isinstance(v, torch.Tensor):
                 batch[k] = v.to(self.device, non_blocking=True)
 
-        # standardize image dtype
+        # Standardize image dtype: keep float32 and let autocast choose math dtype
         img = batch.get("img")
         if img is None:
             raise KeyError("Batch missing 'img' tensor.")
-        batch["img"] = img.half() if getattr(self.args, "half", False) else img.float()
+        batch["img"] = img.float()
 
         # Set BN domain if provided
         bn_dom = batch.get("bn_domain")
@@ -122,20 +122,26 @@ class CAMTLValidator(BaseValidator):
         """
         # Training vs standalone
         self.training = trainer is not None
-        self.args.task = trainer.model.task
+        # task will be derived per-mode below; set a safe default now
+        if not hasattr(self.args, "task"):
+            self.args.task = "DomainShift1"
         augment = False  # no aug at val
 
         if self.training:
             # device/data from trainer
             self.device = trainer.device
             self.data = trainer.data
-            # half precision matches trainer AMP
+            # set task from trainer model if available
+            try:
+                self.args.task = getattr(trainer.model, "task", self.args.task)
+            except Exception:
+                pass
+            # half precision matches trainer AMP (controls autocast only)
             self.args.half = self.device.type != "cpu" and trainer.amp
-            # pick EMA if available for forward, but compute losses with the underlying unwrapped model
+            # pick EMA if available for forward, but DO NOT mutate model dtype here
             fwd_model = trainer.model
             if trainer.args.compile and hasattr(fwd_model, "_orig_mod"):
                 fwd_model = fwd_model._orig_mod
-            fwd_model = fwd_model.half() if self.args.half else fwd_model.float()
             fwd_model.eval()
 
             # prepare loss accumulator vector like BaseValidator
@@ -163,12 +169,18 @@ class CAMTLValidator(BaseValidator):
                 self.device = next(unwrap_model(model).parameters()).device
             except Exception:
                 self.device = torch.device("cpu")
+            # Prefer autocast over mutating weights to half
             self.args.half = self.device.type == "cuda"
 
             fwd_model = model.to(self.device)
-            fwd_model = fwd_model.half() if self.args.half else fwd_model.float()
             unwrap_model(fwd_model).eval()
             self.base_model = unwrap_model(fwd_model)
+
+            # derive task from loaded model if present
+            try:
+                self.args.task = getattr(self.base_model, "task", self.args.task)
+            except Exception:
+                pass
 
             # Ensure criteria exist on the loaded model
             need = ("segment_criterion", "detect_criterion", "consistency_criterion", "align_criterion")
@@ -203,9 +215,12 @@ class CAMTLValidator(BaseValidator):
             with dt[0]:
                 batch = self.preprocess(batch)
 
-            # Inference
+            # Inference (use autocast on CUDA when half enabled)
             with dt[1]:
-                preds = fwd_model(batch["img"], augment=augment)
+                use_amp = self.device.type == "cuda" and bool(self.args.half)
+                amp_ctx = torch.amp.autocast("cuda", enabled=use_amp)
+                with amp_ctx:
+                    preds = fwd_model(batch["img"], augment=augment)
 
             # Collect up to 16 images and their segmentation outputs for a final visualization panel
             try:
@@ -689,7 +704,7 @@ class CAMTLValidator(BaseValidator):
             # Autocast only on CUDA; keep disabled otherwise
             use_cuda = (self.device.type == "cuda")
             use_amp = use_cuda and (param_dtype in (torch.float16, torch.bfloat16))
-            autocast_ctx = torch.cuda.amp.autocast(enabled=use_amp) if use_cuda else contextlib.nullcontext()
+            autocast_ctx = torch.amp.autocast("cuda", enabled=use_amp) if use_cuda else contextlib.nullcontext()
 
             with torch.no_grad(), autocast_ctx:
                 out = base_model(imgs_cast)
