@@ -11,26 +11,33 @@ TASK: CAMTL
 # Tasks: DomainShift1 (COCO-seg -> Retinography-seg); CAMTL (Retinography-seg -> Angiography: vessel-seg + stenosis-det);
 # CAMTL-specific hyperparameters
 LOSS:
+  # detection & weighting
   lambda_det: 1.0
   lambda_seg: 1.0
-  lambda_cons: 0.1
+  lambda_cons: 1e-3
   lambda_align: 0.1
-  lambda_l2sp: 1e-4        # >0 to enable anti-forgetting
+  lambda_l2sp: 1e-4
 
-  align_enable: true
-  align_contain_enable: true
-  align_contain: 0.1
-  align_margin: 0.7
-  align_boxes: gt
-
-  align_suppress_enable: true
-  align_suppress: 0.05
-  align_suppress_margin: 0.1
+  # attention-guided consistency
+  consistency_mode: attn_kl
+  consistency: 1e-3
+  consistency_include_csam: true
+  consistency_eps: 1e-8
 
   det_hyp:
     box: 7.5
     cls: 0.5
     dfl: 1.5
+
+  # per-scale segmentation losses
+  p3: ["LOVASZ"]
+  p4: ["BCE","DICE"]
+  p5: ["BCE","DICE"]
+
+  # init scale weights (learnable)
+  w_p3: 1.0
+  w_p4: 1.0
+  w_p5: 1.0
 
 
 nc: 1

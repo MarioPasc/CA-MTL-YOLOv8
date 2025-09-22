@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import weakref
 import torch
 import torch.nn as nn
+from torch.nn import functional as F
 
+from typing import Optional
 
 class AttentionGuidanceKLLoss(nn.Module):
     """
@@ -20,24 +23,13 @@ class AttentionGuidanceKLLoss(nn.Module):
     """
     def __init__(self, model: nn.Module, weight: float = 1e-3, include_csam: bool = True, eps: float = 1e-8):
         super().__init__()
-        self.model = model
+        # IMPORTANT: do NOT register a strong nn.Module reference here, it creates a module graph cycle
+        # when this loss is attached to the model (model -> loss -> model -> ...).
+        # Keep only a weak reference so train()/eval() recursion over children doesn't revisit the root model.
+        self._model_ref = weakref.ref(model)
         self.weight = float(weight)
         self.include_csam = bool(include_csam)
         self.eps = float(eps)
-
-    @staticmethod
-    def _collect_attn_maps(model: nn.Module, include_csam: bool) -> list[torch.Tensor]:
-        maps: list[torch.Tensor] = []
-        for m in model.modules():
-            # CTAM provides single-scale map
-            if hasattr(m, "last_attn_map") and torch.is_tensor(m.last_attn_map):
-                maps.append(m.last_attn_map)
-            # CSAM may provide multiple per-scale maps
-            if include_csam and hasattr(m, "last_attn_maps") and isinstance(m.last_attn_maps, dict):
-                for v in m.last_attn_maps.values():
-                    if torch.is_tensor(v):
-                        maps.append(v)
-        return maps
 
     @staticmethod
     def _pick_seg_prob_for_size(seg_preds: dict | torch.Tensor, hw: tuple[int, int]) -> torch.Tensor | None:
@@ -73,13 +65,41 @@ class AttentionGuidanceKLLoss(nn.Module):
         q = q / (q.sum(dim=(1,2,3), keepdim=True) + eps)
         return (p * (p.add(eps).log() - q.add(eps).log())).sum(dim=(1,2,3)).mean()  # scalar
 
-    def forward(self, seg_preds: dict | torch.Tensor | None, batch: dict) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    @staticmethod
+    def _collect_attn_maps(model: Optional[nn.Module], include_csam: bool) -> list[torch.Tensor]:
+        """Return cached spatial attention maps from CTAM/CSAM. Safe on None."""
+        if model is None:
+            return []
+        maps: list[torch.Tensor] = []
+        for m in model.modules():
+            if hasattr(m, "last_attn_map") and torch.is_tensor(m.last_attn_map):
+                maps.append(m.last_attn_map)
+            if include_csam and hasattr(m, "last_attn_maps") and isinstance(m.last_attn_maps, dict):
+                for v in m.last_attn_maps.values():
+                    if torch.is_tensor(v):
+                        maps.append(v)
+        return maps
+
+    def forward(self, seg_preds: dict | torch.Tensor | None, batch: dict
+                ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """
+        Dereference weak model reference at call time to avoid graph recursion.
+        Works whether `self.model` is a strong nn.Module or a weakref.ref(nn.Module).
+        """
         dev = batch["img"].device
         if self.weight <= 0.0:
             z = torch.zeros((), device=dev)
             return z, {"cons_kl": z}
 
-        maps = self._collect_attn_maps(self.model, include_csam=self.include_csam)
+        # --- weakref-safe model access ---
+        model_attr = getattr(self, "model", None)
+        model: Optional[nn.Module]
+        if isinstance(model_attr, weakref.ReferenceType):
+            model = model_attr()  # may be None if GC'ed
+        else:
+            model = model_attr if isinstance(model_attr, nn.Module) else None
+
+        maps = self._collect_attn_maps(model, include_csam=self.include_csam)
         if not maps:
             z = torch.zeros((), device=dev)
             return z, {"cons_kl": z}
@@ -87,20 +107,34 @@ class AttentionGuidanceKLLoss(nn.Module):
         total = torch.zeros((), device=dev)
         count = 0
         for a in maps:
-            # ensure [B,1,H,W]
-            if a.ndim == 3:  # [B,H,W]
+            if a.ndim == 3:
                 a = a.unsqueeze(1)
-            elif a.ndim != 4:
+            if a.ndim != 4:
                 continue
             B, C, H, W = a.shape
             if C != 1:
                 a = a.mean(dim=1, keepdim=True)
-            seg_p = self._pick_seg_prob_for_size(seg_preds, (H, W)) # type: ignore
+            a = torch.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
+            if (a.abs().sum(dim=(1, 2, 3)) == 0).any():
+                a = a + 1e-6
+
+            seg_p = self._pick_seg_prob_for_size(seg_preds, (H, W))
             if seg_p is None:
                 continue
             if seg_p.shape[-2:] != (H, W):
-                seg_p = torch.nn.functional.interpolate(seg_p, size=(H, W), mode="bilinear", align_corners=False)
-            total = total + self._kl(a, seg_p, self.eps) # type: ignore
+                seg_p = F.interpolate(seg_p, size=(H, W), mode="bilinear", align_corners=False)
+            seg_p = seg_p.detach()
+            seg_p = torch.nan_to_num(seg_p, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0, 1)
+            if (seg_p.sum(dim=(1, 2, 3)) == 0).any():
+                seg_p = seg_p + 1e-6
+
+            # normalize to distributions and compute KL
+            p = a / (a.sum(dim=(1, 2, 3), keepdim=True) + self.eps)
+            q = seg_p / (seg_p.sum(dim=(1, 2, 3), keepdim=True) + self.eps)
+            kl = (p * (p.add(self.eps).log() - q.add(self.eps).log())).sum(dim=(1, 2, 3)).mean()
+            kl = torch.nan_to_num(kl, nan=0.0, posinf=1e6, neginf=1e6)
+
+            total = total + kl
             count += 1
 
         if count == 0:

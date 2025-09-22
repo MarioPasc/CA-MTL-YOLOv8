@@ -3,6 +3,7 @@ import torch.nn as nn
 from pathlib import Path
 import yaml # type: ignore
 from types import SimpleNamespace
+from torch.cuda.amp import autocast
 
 # Ultralytics modules
 from camtl_yolo.external.ultralytics.ultralytics.nn.modules import (
@@ -153,6 +154,7 @@ class CAMTL_YOLO(DetectionModel):
         initialize_weights(self)
         # --- Task-aware weight loading (COCO or fine-tuned) ---
         self._load_task_weights()
+        
 
     def forward(self, x, *args, **kwargs):
         """
@@ -397,7 +399,14 @@ class CAMTL_YOLO(DetectionModel):
         loss_seg = torch.zeros((), device=device, dtype=dtype)
         if has_seg:
             try:
-                l_seg, seg_items = self.segment_criterion(seg_preds, batch)
+                # Compute segmentation loss in FP32 to avoid AMP half-precision overflows
+                with autocast(enabled=False):
+                    seg_inputs = seg_preds
+                    if isinstance(seg_preds, dict):
+                        seg_inputs = {k: (v.float() if torch.is_tensor(v) else v) for k, v in seg_preds.items()}
+                    elif torch.is_tensor(seg_preds):
+                        seg_inputs = seg_preds.float()
+                    l_seg, seg_items = self.segment_criterion(seg_inputs, batch)
                 if isinstance(seg_items, dict):
                     p3_bce = float(seg_items.get("p3_bce", 0.0))
                     p4_bce = float(seg_items.get("p4_bce", 0.0))
@@ -409,13 +418,14 @@ class CAMTL_YOLO(DetectionModel):
             except Exception as e:
                 LOGGER.warning(f"[loss] segmentation loss failed: {e}")
 
-        # ---- alignment (containment or CTAM), only meaningful if enabled in YAML ----
         align_loss = torch.zeros((), device=device, dtype=dtype)
-        try:
-            a_l, _ = self.align_criterion(seg_preds, det_preds, batch)  # new signature
-            align_loss = a_l if a_l.ndim == 0 else a_l.sum()
-        except Exception as e:
-            LOGGER.warning(f"[loss] alignment loss failed: {e}")
+        if self.args.task != "DomainShift1":
+            # ---- alignment (containment or CTAM), only meaningful if enabled in YAML ----
+            try:
+                a_l, _ = self.align_criterion(seg_preds, det_preds, batch)  # new signature
+                align_loss = a_l if a_l.ndim == 0 else a_l.sum()
+            except Exception as e:
+                LOGGER.warning(f"[loss] alignment loss failed: {e}")
 
         # ---- AttnKL (attention guidance or fallback) ----
         attn_kl = torch.zeros((), device=device, dtype=dtype)
@@ -432,6 +442,7 @@ class CAMTL_YOLO(DetectionModel):
                 l2sp_term = self._l2sp(self)  # type: ignore
             except Exception as e:
                 LOGGER.warning(f"[loss] L2-SP failed: {e}")
+
 
         # ---- Total ----
         total = (
